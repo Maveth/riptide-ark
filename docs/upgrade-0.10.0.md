@@ -62,3 +62,9 @@ duplicates. All 189 server library tests passed.
 
 These are functional checks, not an independent security audit. Release-specific
 package, payment-recovery, and deployment checks must also pass before rollout.
+
+The shared upstream `ark-lib` test harness uses standard Bitcoin signature
+fixtures and a Bitcoin verification kernel. Its full unit suite is not green
+for XBT (134 passed, 36 failed, one ignored); those results are separate from
+the 189 passing server tests. Do not disable signature validation to hide this
+limitation. XBT consensus acceptance is checked against Knots regtest.
