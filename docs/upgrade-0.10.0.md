@@ -50,8 +50,15 @@ an updated wallet with pending payments or recovery actions.
 The integration was tested with a populated schema-68 database, a migration to
 schema 80, and the released Paperclip Wallet 0.9.3. Existing balances survived,
 an Ark transfer completed, and a unilateral exit confirmed with the ASP offline.
-The same older wallet also completed a BOLT11 send and receive through the
-upgraded server in isolated XBT regtest. All 189 server library tests passed.
+The same older wallet completed BOLT11 and BOLT12 sends and receives through the
+upgraded server in isolated XBT regtest. An unreachable recipient failed without
+changing the wallet balance. A pending Lightning payment survived a server
+restart; after receiver cancellation, the wallet recovered its principal, with
+only the recorded recovery allocations deducted and no duplicate credit.
+
+The hold backfill was run twice against a copied test database containing BOLT11
+and BOLT12 subscriptions. It preserved the corresponding holds without creating
+duplicates. All 189 server library tests passed.
 
 These are functional checks, not an independent security audit. Release-specific
 package, payment-recovery, and deployment checks must also pass before rollout.
