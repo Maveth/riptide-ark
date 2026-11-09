@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use bdk_wallet::{TxBuilder, Wallet};
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
+use bdk_wallet::signer::SignersContainer;
 use bip39::Mnemonic;
 use bitcoin::{
 	bip32, Address, Amount, FeeRate, Network, OutPoint, Psbt, Transaction, Weight,
@@ -19,12 +20,15 @@ use bitcoind_async_client::Client as BitcoindClient;
 use tracing::{error, warn};
 
 use bitcoin_ext::BlockRef;
-use bitcoin_ext::bdk::{TrustedBalance, TrustedCanonicalization, WalletExt, KEYCHAIN};
+use bitcoin_ext::bdk::{
+	CpfpInternalError, TrustedBalance, TrustedCanonicalization, WalletExt, KEYCHAIN,
+};
+use bitcoin_ext::cpfp::MakeCpfpFees;
 
 use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::bitcoind as bcd;
 use crate::utils::{InstrumentedLock, InstrumentedOwnedLockGuard};
-use crate::{database, fs_perms, SECP};
+use crate::{database, fs_perms, telemetry, SECP};
 
 
 /// The location of the mnemonic file in server's datadir.
@@ -92,6 +96,7 @@ impl BdkWalletExt for Wallet {}
 
 pub struct PersistedWallet {
 	wallet: Wallet,
+	signers: SignersContainer,
 	kind: WalletKind,
 	db: database::Db,
 	bitcoind: BitcoindClient,
@@ -119,18 +124,18 @@ impl PersistedWallet {
 		let desc = format!("tr({}/0/*)", xpriv);
 		let mut wallet = if let Some(changeset) = init {
 			bdk_wallet::Wallet::load()
-				.descriptor(KEYCHAIN, Some(desc))
+				.descriptor(KEYCHAIN, Some(desc.clone()))
 				.check_network(network)
-				.extract_keys()
 				.load_wallet_no_persist(changeset)
 				.context("error loading bdk wallet")?
 				.expect("changeset is not empty")
 		} else {
-			bdk_wallet::Wallet::create_single(desc)
+			bdk_wallet::Wallet::create_single(desc.clone())
 				.network(network)
 				.create_wallet_no_persist()
 				.context("error creating bdk wallet")?
 		};
+		let signers = wallet.build_signers(&desc).context("error building wallet signers")?;
 
 		if fresh {
 			wallet.set_checkpoint(deep_tip.height.to_u32(), deep_tip.hash);
@@ -139,7 +144,7 @@ impl PersistedWallet {
 		}
 
 		Ok(Self {
-			wallet, kind, db, bitcoind, min_trusted_confs,
+			wallet, signers, kind, db, bitcoind, min_trusted_confs,
 			locked_outputs: LockedWalletUtxosIndex::new(),
 			address_blocklist: None,
 		})
@@ -175,6 +180,7 @@ impl PersistedWallet {
 			self.db.write(async |t| t.store_changeset(self.kind, &change).await).await
 				.context("error persisting wallet changes to db")?;
 			self.wallet.take_staged();
+			telemetry::set_wallet_balance(self.kind, self.balance());
 		}
 		Ok(())
 	}
@@ -196,12 +202,21 @@ impl PersistedWallet {
 		}
 	}
 
+	/// Create and sign a CPFP child spending the fee anchor of `tx`.
+	pub fn make_signed_p2a_cpfp(
+		&mut self,
+		tx: &Transaction,
+		fees: MakeCpfpFees,
+	) -> Result<Transaction, CpfpInternalError> {
+		self.wallet.make_signed_p2a_cpfp(tx, fees, &self.signers)
+	}
+
 	/// Finish the PSBT by signing it and committing it to the wallet.
 	///
 	/// This method does not persist changes to the database.
 	pub fn finish_tx(&mut self, mut psbt: Psbt) -> anyhow::Result<Transaction> {
 		let fee = psbt.fee().context("error calculating fee")?;
-		let finalized = bitcoin_ext::unified_wallet::sign(self, &mut psbt).context("error signing psbt")?;
+		let finalized = bitcoin_ext::unified_wallet::sign_with_signers(&mut psbt, &[&self.signers]).context("error signing psbt")?;
 		ensure!(finalized, "tx not finalized after signing, psbt: {}", psbt.serialize().as_hex());
 		let ret = psbt.extract_tx().context("error extracting finalized tx from psbt")?;
 		let txid = ret.compute_txid();
@@ -491,7 +506,7 @@ impl ops::DerefMut for PersistedWallet {
 pub fn read_mnemonic_from_datadir(data_dir: &Path) -> anyhow::Result<Mnemonic> {
 	let path = data_dir.join(MNEMONIC_FILE);
 	fs_perms::warn_if_loose(data_dir, 0o700);
-	fs_perms::warn_if_loose(&path, 0o600);
+	fs_perms::refuse_if_loose(&path, 0o600)?;
 	let mnemonic = std::fs::read_to_string(&path)
 		.context("failed to read mnemonic")?;
 	Ok(Mnemonic::from_str(&mnemonic)?)
@@ -626,6 +641,29 @@ mod test {
 		assert_eq!(watchman, WalletKind::Watchman.child_number());
 	}
 
+	#[cfg(unix)]
+	#[test]
+	fn read_mnemonic_refuses_loose_permissions() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let datadir = std::env::temp_dir()
+			.join(format!("server-mnemonic-perms-{}-{}", std::process::id(), nanos));
+		std::fs::create_dir(&datadir).unwrap();
+		let path = datadir.join(MNEMONIC_FILE);
+		std::fs::write(&path, Mnemonic::generate(12).unwrap().to_string()).unwrap();
+
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+		let loose = read_mnemonic_from_datadir(&datadir);
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+		let tight = read_mnemonic_from_datadir(&datadir);
+		std::fs::remove_dir_all(&datadir).unwrap();
+
+		let err = loose.expect_err("a mnemonic readable by other users must be refused");
+		assert!(err.to_string().contains("accessible by other users"), "{err:#}");
+		tight.expect("an owner-only mnemonic must load");
+	}
+
 	#[test]
 	fn wallet_utxo_guard_double_lock() {
 		let index = LockedWalletUtxosIndex::new();
@@ -678,9 +716,8 @@ mod builder_test {
 	}
 
 	fn sign(wallet: &mut Wallet, mut psbt: Psbt) -> Transaction {
-		#[allow(deprecated)]
-		let opts = bdk_wallet::SignOptions { trust_witness_utxo: true, ..Default::default() };
-		assert!(wallet.sign(&mut psbt, opts).unwrap());
+		let signers = wallet.build_signers(get_test_tr_single_sig_xprv()).unwrap();
+		assert!(bitcoin_ext::unified_wallet::sign_with_signers(&mut psbt, &[&signers]).unwrap());
 		psbt.extract_tx().unwrap()
 	}
 

@@ -112,6 +112,28 @@ where
 	Ok(Some(res))
 }
 
+/// An entry of the `gettxspendingprevout` result.
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct TxSpendingPrevoutResult {
+	pub txid: Txid,
+	pub vout: u32,
+	#[serde(rename = "spendingtxid")]
+	pub spending_txid: Option<Txid>,
+	/// Only set for confirmed spends, when bitcoind runs a spender index.
+	#[serde(rename = "blockhash")]
+	pub block_hash: Option<bitcoin::BlockHash>,
+}
+
+impl TxSpendingPrevoutResult {
+	/// The spending tx if it is in the mempool.
+	pub fn mempool_spending_txid(&self) -> Option<Txid> {
+		match self.block_hash {
+			Some(_) => None,
+			None => self.spending_txid,
+		}
+	}
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetRawTransactionResultVinScriptSig {
@@ -215,6 +237,21 @@ pub struct SubmitPackageResult {
 pub struct SubmitPackageTxResult {
 	pub txid: Txid,
 	pub error: Option<String>,
+}
+
+/// The ancestor fields of the `getmempoolentry` RPC call. The bitcoincore_rpc
+/// type requires `bip125-replaceable`, which bitcoind v32 no longer returns.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MempoolEntryAncestors {
+	#[serde(rename = "ancestorsize")]
+	pub ancestor_size: u64,
+	pub fees: MempoolEntryAncestorFees,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MempoolEntryAncestorFees {
+	#[serde(with = "bitcoin::amount::serde::as_btc")]
+	pub ancestor: Amount,
 }
 
 /// Shorthand for converting a variable into a serde_json::Value.
@@ -389,18 +426,11 @@ pub trait BitcoinRpcExt: RpcApi {
 		&self,
 		outpoint: bitcoin::OutPoint,
 	) -> Result<Option<Txid>, Error> {
-		// Get all mempool txids
-		let mempool_txids: Vec<Txid> = self.call("getrawmempool", &[false.into()])?;
-
-		for txid in mempool_txids {
-			let tx = self.get_raw_transaction(&txid, None)?;
-			for input in &tx.input {
-				if input.previous_output == outpoint {
-					return Ok(Some(txid));
-				}
-			}
-		}
-		Ok(None)
+		let prevout = serde_json::json!({ "txid": outpoint.txid, "vout": outpoint.vout });
+		let res: Vec<TxSpendingPrevoutResult> = self.call(
+			"gettxspendingprevout", &[serde_json::Value::Array(vec![prevout])],
+		)?;
+		Ok(res.first().and_then(|s| s.mempool_spending_txid()))
 	}
 }
 
@@ -563,5 +593,32 @@ mod pruned_tests {
 			assert!(!pruned_history_ready(&bad, &chain, "genesis"), "{key}");
 		}
 		assert!(!pruned_history_ready(&json!({}), &chain, "genesis"));
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn tx_spending_prevout_result() {
+		let txid = "f8e58a46414f82b19e8aa5aa8992fc90ca89dc8da2f78f13291a5c3602258390";
+		let spender = "c17e3b374433195988f7fd1d40eca78cbc88f2f9d9ec2100193bc00606f3c84b";
+		let block = "00000000000000000001e0d2b9b8b6d33e7a6d6c8a4f3f0e2c1b0a9f8e7d6c5b";
+
+		let unspent: Vec<TxSpendingPrevoutResult> = serde_json::from_str(&format!(
+			r#"[{{"txid":"{txid}","vout":0}}]"#,
+		)).unwrap();
+		assert_eq!(unspent[0].mempool_spending_txid(), None);
+
+		let in_mempool: Vec<TxSpendingPrevoutResult> = serde_json::from_str(&format!(
+			r#"[{{"txid":"{txid}","vout":1,"spendingtxid":"{spender}"}}]"#,
+		)).unwrap();
+		assert_eq!(in_mempool[0].mempool_spending_txid(), Some(spender.parse().unwrap()));
+
+		let confirmed: Vec<TxSpendingPrevoutResult> = serde_json::from_str(&format!(
+			r#"[{{"txid":"{txid}","vout":1,"spendingtxid":"{spender}","blockhash":"{block}"}}]"#,
+		)).unwrap();
+		assert_eq!(confirmed[0].mempool_spending_txid(), None);
 	}
 }

@@ -19,6 +19,7 @@ mod compatibility;
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
@@ -30,6 +31,7 @@ use ark::lightning::PaymentHash;
 use cln_rpc::node_client::NodeClient;
 
 use crate::ln::node_manager::NodeState;
+use crate::ln::guard::PaymentGuards;
 use crate::ln::settler::HtlcSettler;
 use crate::sync::SyncManager;
 use crate::system::RuntimeManager;
@@ -42,6 +44,9 @@ use self::hold::{ClnHold, ClnHoldConfig};
 use self::xpay::{ClnXpay, ClnXpayClient, ClnXpayConfig};
 
 type ClnGrpcClient = NodeClient<Channel>;
+
+/// How long connecting to a node and asking its info may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cheap, cloneable command handle to a running node.
 ///
@@ -121,13 +126,18 @@ impl ClnNodeInfo {
 		sync_manager: &Arc<SyncManager>,
 		mailbox_manager: &Arc<crate::mailbox_manager::MailboxManager>,
 		settler: &Arc<HtlcSettler>,
+		payment_guards: &PaymentGuards,
 	) -> anyhow::Result<LightningNodeId> {
-		let mut rpc = self.config.build_grpc_client().await.context("failed to connect rpc")?;
-		let hold_rpc = self.config.build_hold_client().await.context("failed to connect hold rpc")?;
-
-		let info = rpc.getinfo(cln_rpc::GetinfoRequest {}).await
-			.context("failed to get info from rpc")?
-			.into_inner();
+		// A node that accepts the connection but never answers would otherwise
+		// hold up the manager, which checks the nodes one by one.
+		let (rpc, hold_rpc, info) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+			let mut rpc = self.config.build_grpc_client().await.context("failed to connect rpc")?;
+			let hold_rpc = self.config.build_hold_client().await.context("failed to connect hold rpc")?;
+			let info = rpc.getinfo(cln_rpc::GetinfoRequest {}).await
+				.context("failed to get info from rpc")?
+				.into_inner();
+			anyhow::Ok((rpc, hold_rpc, info))
+		}).await.context("timed out connecting to the node")??;
 
 		let network = bitcoin::Network::from_str(info.network.as_str())
 			.context(NodeState::invalid("network invalid"))?;
@@ -137,6 +147,15 @@ impl ClnNodeInfo {
 
 		if network != expected_network {
 			let msg = format!("network is {network} instead of {expected_network}");
+			return Err(anyhow::Error::msg(msg.clone()).context(NodeState::invalid(msg)));
+		}
+
+		let version = parse_cln_version(&info.version).with_context(||
+			NodeState::invalid(format!("unrecognized version {}", info.version))
+		)?;
+		if version < MIN_CLN_VERSION {
+			let (major, minor) = MIN_CLN_VERSION;
+			let msg = format!("version is {}, need v{major}.{minor:02} or later", info.version);
 			return Err(anyhow::Error::msg(msg.clone()).context(NodeState::invalid(msg)));
 		}
 
@@ -156,6 +175,7 @@ impl ClnNodeInfo {
 			monitor_config.clone(),
 			sync_manager.clone(),
 			mailbox_manager.clone(),
+			payment_guards.clone(),
 		).await.context("failed to start ClnHold")?;
 
 		let xpay = ClnXpay::start(
@@ -182,5 +202,38 @@ impl ClnNodeInfo {
 		self.set_state(new_state);
 
 		Ok(id)
+	}
+}
+
+/// Older `listpays` can report a payment failed while xpay still retries it.
+const MIN_CLN_VERSION: (u32, u32) = (26, 6);
+
+/// Reads major and minor from versions like `v26.06.6`, `v26.06rc1` or `v26.06-modded`.
+fn parse_cln_version(version: &str) -> Option<(u32, u32)> {
+	let mut parts = version.strip_prefix('v').unwrap_or(version).split('.');
+	let major = parts.next()?.parse().ok()?;
+	let minor = parts.next()?;
+	let minor_end = minor.find(|c: char| !c.is_ascii_digit()).unwrap_or(minor.len());
+	let minor = minor[..minor_end].parse().ok()?;
+	Some((major, minor))
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn parse_cln_versions() {
+		assert_eq!(parse_cln_version("v26.06.6"), Some((26, 6)));
+		assert_eq!(parse_cln_version("v26.06"), Some((26, 6)));
+		assert_eq!(parse_cln_version("v26.06rc1"), Some((26, 6)));
+		assert_eq!(parse_cln_version("v26.06.7-hold"), Some((26, 6)));
+		assert_eq!(parse_cln_version("v25.12.1-12-gabcdef"), Some((25, 12)));
+		assert_eq!(parse_cln_version("26.04.1"), Some((26, 4)));
+		assert_eq!(parse_cln_version("vx.y"), None);
+		assert_eq!(parse_cln_version(""), None);
+		assert!(parse_cln_version("v26.04.2").unwrap() < MIN_CLN_VERSION);
+		assert!(parse_cln_version("v26.06").unwrap() >= MIN_CLN_VERSION);
+		assert!(parse_cln_version("v27.01").unwrap() >= MIN_CLN_VERSION);
 	}
 }

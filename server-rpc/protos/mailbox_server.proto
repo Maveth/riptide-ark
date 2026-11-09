@@ -68,6 +68,9 @@ message LightningSendFinishedMessage {
 	// The preimage, present only on success (proves payment was made).
 	// Absent when payment failed.
 	optional bytes preimage = 2;
+	// Why it failed, present only on failure. A failed notification without
+	// it comes from a server that predates this field.
+	optional core.LightningPaymentFailure failure = 3;
 }
 
 message MailboxMessages {
@@ -82,6 +85,6 @@ message PostRecoveryVtxoIdsRequest {
 	// The recovery IDs.
 	// Maximum number of IDs is set in the `MAX_NB_MAILBOX_RECOVERY_IDS` constant
 	repeated bytes vtxo_ids = 2;
-	// Signed proof of mailbox ownership. Optional for now for backward compat.
+	// A signed proof of mailbox ownership, required by the server
 	optional bytes authorization = 3;
 }

@@ -188,12 +188,29 @@ impl TryFrom<i32> for BlockHeight {
 	}
 }
 
+impl TryFrom<BlockHeight> for i32 {
+	type Error = std::num::TryFromIntError;
+
+	fn try_from(v: BlockHeight) -> Result<i32, Self::Error> {
+		i32::try_from(v.0)
+	}
+}
+
 /// Add a delta to the height, saturating at [u32::MAX].
 impl ops::Add<BlockDelta> for BlockHeight {
 	type Output = BlockHeight;
 
 	fn add(self, rhs: BlockDelta) -> BlockHeight {
 		self.add_delta(rhs)
+	}
+}
+
+/// Add small numbers to the height, saturating at [u32::MAX].
+impl ops::Add<u8> for BlockHeight {
+	type Output = BlockHeight;
+
+	fn add(self, rhs: u8) -> BlockHeight {
+		self.add_delta(BlockDelta::from(rhs as u16))
 	}
 }
 

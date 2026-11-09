@@ -17,10 +17,16 @@ wallet service that stays online. Existing BOLT11 wallets remain supported.
 `MAINNET.md`. This software is not independently audited and has no warranty.
 Functional tests do not guarantee security or recovery.
 
-The current release adds reusable BOLT12 receiving and a configurable
-[on-chain payout reserve](docs/payout-liquidity.md). Paid BOLT12 settlement,
-cancellation, restart, failure recovery, and old-wallet compatibility passed XBT
-regtest tests. Live mainnet checks verified offer/invoice exchange without payment.
+Reusable BOLT12 receiving and a configurable
+[on-chain payout reserve](docs/payout-liquidity.md) remain supported.
+
+## 0.10.0: Bark 0.8.1 integration
+
+This source integrates upstream Bark 0.8.1 while retaining XBT signatures,
+funded exits, economical transfers, BOLT12 receiving, and older Paperclip clients.
+It adds Lightning payment accounting records, configurable receive-invoice expiry,
+and protection against replacing a round participation whose inputs are already
+being processed. See [upgrade requirements](docs/upgrade-0.10.0.md).
 
 ## 0.9.0: smaller ordinary-transfer recovery allocations
 

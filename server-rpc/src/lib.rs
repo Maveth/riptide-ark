@@ -45,7 +45,7 @@ mod convert;
 pub use crate::convert::{ConvertError, TryFromBytes};
 
 mod error;
-pub use crate::error::StatusExt;
+pub use crate::error::{StatusExt, IN_FLIGHT_INPUTS_METADATA_KEY};
 
 pub mod pver;
 
@@ -75,8 +75,9 @@ pub mod admin {
 	pub use crate::protos::bark_server::wallet_admin_service_client::WalletAdminServiceClient;
 	pub use crate::protos::bark_server::round_admin_service_client::RoundAdminServiceClient;
 	pub use crate::protos::bark_server::lightning_admin_service_client::LightningAdminServiceClient;
-	pub use crate::protos::bark_server::sweep_admin_service_client::SweepAdminServiceClient;
+	pub use crate::protos::bark_server::watchman_admin_service_client::WatchmanAdminServiceClient;
 	pub use crate::protos::bark_server::ban_admin_service_client::BanAdminServiceClient;
+	pub use crate::protos::bark_server::blocklist_admin_service_client::BlocklistAdminServiceClient;
 	pub use crate::protos::bark_server::nursery_admin_service_client::NurseryAdminServiceClient;
 }
 
@@ -91,8 +92,10 @@ pub mod server {
 	pub use crate::protos::bark_server::wallet_admin_service_server::{WalletAdminService, WalletAdminServiceServer};
 	pub use crate::protos::bark_server::round_admin_service_server::{RoundAdminService, RoundAdminServiceServer};
 	pub use crate::protos::bark_server::lightning_admin_service_server::{LightningAdminService, LightningAdminServiceServer};
+	pub use crate::protos::bark_server::watchman_admin_service_server::{WatchmanAdminService, WatchmanAdminServiceServer};
 	pub use crate::protos::bark_server::sweep_admin_service_server::{SweepAdminService, SweepAdminServiceServer};
 	pub use crate::protos::bark_server::ban_admin_service_server::{BanAdminService, BanAdminServiceServer};
+	pub use crate::protos::bark_server::blocklist_admin_service_server::{BlocklistAdminService, BlocklistAdminServiceServer};
 	pub use crate::protos::bark_server::nursery_admin_service_server::{NurseryAdminService, NurseryAdminServiceServer};
 	pub use crate::protos::intman::integration_service_server::{IntegrationService, IntegrationServiceServer};
 	pub use crate::protos::mailbox_server::mailbox_service_server::{MailboxService, MailboxServiceServer};
@@ -132,8 +135,18 @@ pub const PROTOCOL_VERSION_HEADER: &str = "pver";
 /// The maximum number of recovery IDs that the server accepts per request.
 pub const MAX_NB_MAILBOX_RECOVERY_IDS: usize = 20;
 
+/// The number of child keys the server derives from a client xpub and looks
+/// up in one batch when recovering VTXOs by xpub.
+pub const RECOVERY_XPUB_CHUNK_SIZE: u32 = 10_000;
+
 /// The maximum number of vtxo IDs that the server accepts per forfeit nonces request.
 pub const MAX_NB_FORFEIT_NONCE_IDS: usize = 1000;
+
+/// The maximum number of vtxo IDs that the server accepts per by-ids request.
+pub const MAX_NB_VTXO_IDS: usize = 1000;
+
+/// The maximum number of vtxos that the server accepts per register request.
+pub const MAX_NB_REGISTER_VTXOS: usize = 1000;
 
 /// The maximum number of vtxos that the server accepts per arkoor mailbox
 /// post. Generous for a single payment's outputs to one recipient; clients

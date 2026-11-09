@@ -3,6 +3,12 @@
 #[macro_use] extern crate serde;
 #[macro_use] extern crate server_log;
 
+// We assume a 64-bit target throughout the codebase, primarily so
+// that u32 and u64 values can be converted into usize using `as`
+// without truncation.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("the server crate only supports 64-bit targets");
+
 #[macro_use]
 mod error;
 
@@ -27,6 +33,7 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
+pub mod recovery;
 mod round;
 pub mod telemetry;
 pub mod utils;
@@ -58,7 +65,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, trace, warn};
 
-use ark::{Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
+use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::vtxo::Full;
 use ark::board::BoardBuilder;
 use ark::fees::validate_and_subtract_fee;
@@ -213,6 +220,10 @@ pub struct Server {
 	/// The payment hash locks. Each lightning call that decides on a payment
 	/// holds the lock of its payment hash for the whole call.
 	payment_guards: PaymentGuards,
+	/// One permit for each xpub recovery call that may run or wait at once.
+	xpub_recovery_queue: tokio::sync::Semaphore,
+	/// One permit for each xpub recovery scan that may run at once.
+	xpub_recovery_permits: tokio::sync::Semaphore,
 	lightning_manager: LightningManager,
 	htlc_settler: Arc<HtlcSettler>,
 	vtxopool: VtxoPool,
@@ -347,6 +358,11 @@ impl Server {
 			server_key.public_key(),
 		);
 		info!("Running with config: {:#?}", cfg);
+		if cfg.ln_max_fee_ppm > 1_000_000 {
+			warn!("ln_max_fee_ppm is {}, above 100%: lightning sends may pay more routing \
+				fee than the user's fee covers", cfg.ln_max_fee_ppm,
+			);
+		}
 
 		info!("Starting server at {}", cfg.data_dir.display());
 
@@ -425,6 +441,7 @@ impl Server {
 		).await.context("Failed to start SyncManager")?);
 
 		let mailbox_manager = Arc::new(MailboxManager::new());
+		let payment_guards = PaymentGuards::new();
 
 		let cln = LightningManager::start(
 			rtmgr.clone(),
@@ -433,6 +450,7 @@ impl Server {
 			sync_manager.clone(),
 			mailbox_manager.clone(),
 			htlc_settler.clone(),
+			payment_guards.clone(),
 		).await.context("failed to start LightningManager")?;
 
 		let vtxopool = VtxoPool::new(cfg.vtxopool.clone(), &db).await
@@ -463,7 +481,9 @@ impl Server {
 			},
 			forfeit_nonces: parking_lot::Mutex::new(TimedEntryMap::new()),
 			vtxos_in_flux: VtxosInFlux::new(),
-			payment_guards: PaymentGuards::new(),
+			payment_guards,
+			xpub_recovery_queue: tokio::sync::Semaphore::new(recovery::XPUB_RECOVERY_QUEUE_SIZE),
+			xpub_recovery_permits: tokio::sync::Semaphore::new(cfg.max_concurrent_xpub_recoveries),
 			config: cfg.clone(),
 			db,
 			server_pubkey: server_key.public_key(),
@@ -676,6 +696,15 @@ impl Server {
 			if utxo.txid != funding_tx.compute_txid() {
 				return badarg!("board outpoint does not match funding tx (txid)");
 			}
+			// The exit tx we cosign commits to `amount` as the funding output's
+			// value, so a funding output paying anything else yields a board
+			// that can neither be registered nor unilaterally exited.
+			let funding_value = funding_tx.output[utxo.vout as usize].value;
+			if funding_value != amount {
+				return badarg!("board amount {} does not match funding tx output value {}",
+					amount, funding_value,
+				);
+			}
 
 			// validate funding tx is real
 			// check that any of the inputs is a vtxo
@@ -727,6 +756,15 @@ impl Server {
 			user_pub_nonce,
 		)?;
 
+		// Fees and the exit delta can change, so bind the output to one exit
+		// before signing, or two signed exits could spend it.
+		let spk = builder.funding_script_pubkey();
+		let exit_txid = builder.exit_txid();
+		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid).await).await?;
+		if bound != exit_txid {
+			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
+		}
+
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
 
@@ -743,6 +781,8 @@ impl Server {
 	/// - The VTXO is actually a board (not another VTXO type)
 	#[tracing::instrument(skip(self, vtxo))]
 	pub async fn register_board(&self, vtxo: Vtxo<Full>) -> anyhow::Result<()> {
+		check_max_amount("board", vtxo.amount(), self.config.max_board_amount)?;
+
 		let funding_txid = vtxo.chain_anchor().txid;
 		let funding_vout = vtxo.chain_anchor().vout;
 		let tx_info = bcd::custom_get_raw_transaction_info(&self.bitcoind, funding_txid, None).await
@@ -812,7 +852,16 @@ impl Server {
 			.upsert_unsigned_tx([builder.exit_txid()])
 			.insert_spendable_vtxos(builder.build_server_vtxos())
 			.mark_vtxos_oor_spent(builder.spend_info());
+		let spk = builder.funding_script_pubkey();
+		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
+			// also binds boards cosigned before outputs were bound on cosign
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid).await?;
+			if bound != exit_txid {
+				return badarg!("board utxo {} is already registered with another exit tx",
+					vtxo.chain_anchor(),
+				);
+			}
 			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
@@ -837,11 +886,71 @@ impl Server {
 		Ok(())
 	}
 
+	/// Refuses a vtxo whose chain spends an exited user vtxo through a
+	/// transaction the server does not hold signed yet.
+	///
+	/// Until the chain is registered the server holds the arkoor
+	/// transactions unsigned, so when their input exits onchain the watchman
+	/// can only wait and the owner takes the input through its exit clause
+	/// once the exit delta passed.
+	async fn check_registration_inputs_not_exited(
+		&self,
+		vtxo: &Vtxo<Full>,
+	) -> anyhow::Result<()> {
+		let mut spends = Vec::new();
+		for item in vtxo.transactions() {
+			let txid = item.tx.compute_txid();
+			for input in &item.tx.input {
+				spends.push((VtxoId::from(input.previous_output), txid));
+			}
+		}
+		let ids = spends.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let states = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await?;
+
+		for (id, txid) in spends {
+			let exited = states.get(&id).is_some_and(|s| {
+				matches!(s.vtxo.policy(), ServerVtxoPolicy::User(_)) && s.is_exited()
+			});
+			if !exited {
+				continue;
+			}
+			let signed = self.db.read(async |t| t.get_virtual_transaction_by_txid(txid).await).await?
+				.is_some_and(|vtx| vtx.signed_tx.is_some());
+			if !signed {
+				return badarg!("vtxo {} spends vtxo {} that has exited onchain", vtxo.id(), id);
+			}
+		}
+		Ok(())
+	}
+
+	/// Refuses a vtxo that differs from the stored vtxo with the same id in
+	/// anything but its witnesses.
+	///
+	/// The id only commits to the vtxo's point. Validation against the chain
+	/// anchor doesn't pin the rest either: a pubkey vtxo can be re-anchored
+	/// at its own point with an empty chain, and its output doesn't commit to
+	/// the expiry. Registration overwrites the stored blob, which offboards,
+	/// arkoor and the watchman build on, so it may only add signatures.
+	fn check_registration_matches_stored(
+		stored: &Vtxo<Full>,
+		vtxo: &Vtxo<Full>,
+	) -> anyhow::Result<()> {
+		// The bare encoding holds every field outside the chain, and the txids
+		// pin everything in the chain but its witnesses.
+		let stored_txids = stored.transactions().map(|i| i.tx.compute_txid()).collect::<Vec<_>>();
+		let txids = vtxo.transactions().map(|i| i.tx.compute_txid()).collect::<Vec<_>>();
+		if vtxo.to_bare().serialize() != stored.to_bare().serialize() || txids != stored_txids {
+			return badarg!("vtxo {} does not match the stored vtxo", vtxo.id());
+		}
+		Ok(())
+	}
+
 	/// Registers the given VTXOs: validates and stores their signed
 	/// transaction chains and flips them from `unregistered` to `spendable`.
 	///
 	/// For each VTXO:
 	/// - Checks it exists in the database
+	/// - Checks it matches the stored vtxo apart from its witnesses
 	/// - Checks it is fully signed
 	/// - Validates signatures against the chain anchor transaction
 	/// - Extracts transactions for the virtual_transaction table
@@ -879,9 +988,11 @@ impl Server {
 			let vtxo_id = vtxo.id();
 
 			// Check vtxo exists in database
-			let _stored_vtxo = self.db.read(async |t| t.get_user_vtxo_by_id(vtxo_id).await).await
+			let stored = self.db.read(async |t| t.get_user_vtxo_by_id(vtxo_id).await).await
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
+
+			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			// Check vtxo is fully signed
 			if !vtxo.has_all_witnesses() {
@@ -905,6 +1016,8 @@ impl Server {
 				.context(vtxo_id)
 				.badarg("vtxo validation failed")?;
 
+			self.check_registration_inputs_not_exited(vtxo).await?;
+
 			// Collect all signed transactions from the VTXO, deduplicating
 			// by txid since different vtxos can share parent transactions.
 			for item in vtxo.transactions() {
@@ -923,8 +1036,7 @@ impl Server {
 		// vtxos from `unregistered` to `spendable` in a single tx. The state
 		// flip only affects `unregistered` vtxos; the stored vtxo bytes are
 		// overwritten regardless of state, which is safe because each vtxo was
-		// validated above as a fully-signed version of that id, and any valid
-		// fully-signed version serves recovery equally well.
+		// checked above to differ from the stored one only in its witnesses.
 		let update = VtxoTreeUpdate::new()
 			.upsert_signed_tx(signed_txs)
 			.provide_signatures(vtxos)
@@ -982,7 +1094,7 @@ impl Server {
 		Ok(Keypair::from_secret_key(&*SECP, &seckey))
 	}
 
-	#[tracing::instrument(skip(self, vtxos))]
+	#[tracing::instrument(skip(self, vtxos, unlock_preimage))]
 	pub async fn cosign_vtxo_tree(
 		&self,
 		vtxos: impl IntoIterator<Item = VtxoRequest>,

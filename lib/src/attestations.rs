@@ -3,13 +3,16 @@ use std::io::{self, Write as _};
 use bitcoin::consensus::WriteExt;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::key::Keypair;
-use bitcoin::secp256k1::{self, schnorr, Message};
+use bitcoin::secp256k1::{self, schnorr, Message, PublicKey};
+use bitcoin_ext::BlockHeight;
 
 use crate::{SignedVtxoRequest, Vtxo, VtxoId, VtxoRequest, SECP};
 use crate::arkoor::ArkoorDestination;
 use crate::encode::{ProtocolEncoding, ProtocolDecodingError};
 use crate::lightning::PaymentHash;
+use crate::mailbox::MailboxIdentifier;
 use crate::offboard::OffboardRequest;
+use crate::tree::signed::UnlockHash;
 
 /// Random 32-byte challenge for challenge-response protocols
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +236,64 @@ impl ProtocolEncoding for LightningReceiveAttestation {
 	}
 }
 
+/// Attestation by the receiver of a Lightning payment that it asks the server
+/// to prepare the claim of that payment.
+///
+/// It is signed with the key the receiver committed to when starting the
+/// receive, and commits to the HTLC-recv expiry, so nobody else can trigger
+/// or shape the grant of HTLC-recv VTXOs for the payment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct LightningReceiveClaimAttestation {
+	signature: schnorr::Signature,
+}
+
+impl LightningReceiveClaimAttestation {
+	const MESSAGE_PREFIX: &'static [u8; 32] = b"Lightning receive claim key auth";
+
+	/// Create a new attestation by signing with the claim keypair
+	pub fn new(
+		payment_hash: PaymentHash,
+		htlc_recv_expiry: BlockHeight,
+		claim_keypair: &Keypair,
+	) -> Self {
+		let msg = Self::compute_message(payment_hash, htlc_recv_expiry);
+		let signature = SECP.sign_schnorr_with_aux_rand(&msg, claim_keypair, &rand::random());
+		Self { signature }
+	}
+
+	/// Verify the attestation against the claim key
+	pub fn verify(
+		&self,
+		payment_hash: PaymentHash,
+		htlc_recv_expiry: BlockHeight,
+		claim_pubkey: PublicKey,
+	) -> Result<(), secp256k1::Error> {
+		let msg = Self::compute_message(payment_hash, htlc_recv_expiry);
+		SECP.verify_schnorr(&self.signature, &msg, &claim_pubkey.x_only_public_key().0)
+	}
+
+	fn compute_message(payment_hash: PaymentHash, htlc_recv_expiry: BlockHeight) -> Message {
+		let mut engine = sha256::Hash::engine();
+		engine.write_all(Self::MESSAGE_PREFIX).unwrap();
+		engine.write_all(&payment_hash.to_byte_array()).unwrap();
+		engine.write_all(&htlc_recv_expiry.to_u32().to_be_bytes()).unwrap();
+
+		let hash = sha256::Hash::from_engine(engine).to_byte_array();
+		Message::from_digest(hash)
+	}
+}
+
+impl ProtocolEncoding for LightningReceiveClaimAttestation {
+	fn encode<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.signature.encode(writer)
+	}
+
+	fn decode<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolDecodingError> {
+		let signature = schnorr::Signature::decode(reader)?;
+		Ok(Self { signature })
+	}
+}
+
 /// Attestation for proving ownership of a VTXO when querying its status.
 ///
 /// This is the simplest attestation - it only commits to the VTXO ID itself,
@@ -410,6 +471,97 @@ impl ProtocolEncoding for ArkoorCosignAttestation {
 	}
 }
 
+/// Attestation for querying the status of a delegated round participation
+///
+/// Signed with the mailbox key the participation was registered with, which
+/// a wallet restored from seed still has, unlike the keys of its inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct RoundParticipationStatusAttestation {
+	signature: schnorr::Signature,
+}
+
+impl RoundParticipationStatusAttestation {
+	const CHALLENGE_MESSAGE_PREFIX: &'static [u8; 32] = b"round participation status att. ";
+
+	pub fn new(unlock_hash: UnlockHash, mailbox_keypair: &Keypair) -> Self {
+		let msg = Self::compute_message(unlock_hash);
+		let signature = SECP.sign_schnorr_with_aux_rand(&msg, mailbox_keypair, &rand::random());
+		Self { signature }
+	}
+
+	/// Verify the attestation against the participation's mailbox
+	pub fn verify(
+		&self,
+		unlock_hash: UnlockHash,
+		mailbox_id: MailboxIdentifier,
+	) -> Result<(), secp256k1::Error> {
+		let msg = Self::compute_message(unlock_hash);
+		SECP.verify_schnorr(&self.signature, &msg, &mailbox_id.as_pubkey().x_only_public_key().0)
+	}
+
+	fn compute_message(unlock_hash: UnlockHash) -> Message {
+		let mut eng = sha256::Hash::engine();
+		eng.input(Self::CHALLENGE_MESSAGE_PREFIX);
+		eng.input(&unlock_hash.to_byte_array());
+		Message::from_digest(sha256::Hash::from_engine(eng).to_byte_array())
+	}
+}
+
+impl ProtocolEncoding for RoundParticipationStatusAttestation {
+	fn encode<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.signature.encode(writer)
+	}
+
+	fn decode<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolDecodingError> {
+		let signature = schnorr::Signature::decode(reader)?;
+		Ok(Self { signature })
+	}
+}
+
+/// Attestation for requesting hArk forfeit nonces for a round input
+///
+/// Proves the requester owns the input, so the server only tells the owner
+/// whether the input belongs to the participation with this unlock hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct ForfeitNoncesAttestation {
+	signature: schnorr::Signature,
+}
+
+impl ForfeitNoncesAttestation {
+	const CHALLENGE_MESSAGE_PREFIX: &'static [u8; 32] = b"hArk forfeit nonces attestation ";
+
+	pub fn new(unlock_hash: UnlockHash, vtxo_id: VtxoId, vtxo_keypair: &Keypair) -> Self {
+		let msg = Self::compute_message(unlock_hash, vtxo_id);
+		let signature = SECP.sign_schnorr_with_aux_rand(&msg, vtxo_keypair, &rand::random());
+		Self { signature }
+	}
+
+	/// Verify the attestation against a VTXO and unlock hash
+	pub fn verify(&self, unlock_hash: UnlockHash, vtxo: &Vtxo) -> Result<(), secp256k1::Error> {
+		let msg = Self::compute_message(unlock_hash, vtxo.id());
+		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
+	}
+
+	fn compute_message(unlock_hash: UnlockHash, vtxo_id: VtxoId) -> Message {
+		let mut eng = sha256::Hash::engine();
+		eng.input(Self::CHALLENGE_MESSAGE_PREFIX);
+		eng.input(&unlock_hash.to_byte_array());
+		eng.input(&vtxo_id.to_bytes());
+		Message::from_digest(sha256::Hash::from_engine(eng).to_byte_array())
+	}
+}
+
+impl ProtocolEncoding for ForfeitNoncesAttestation {
+	fn encode<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.signature.encode(writer)
+	}
+
+	fn decode<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolDecodingError> {
+		let signature = schnorr::Signature::decode(reader)?;
+		Ok(Self { signature })
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -496,6 +648,26 @@ mod tests {
 		let hardcoded = DelegatedRoundParticipationAttestation::deserialize_hex(&vector)
 			.expect("valid attestation");
 		hardcoded.verify(&vtxo, &vtxo_reqs).expect("hardcoded verification failed");
+	}
+
+	#[test]
+	fn test_lightning_receive_claim_attestation() {
+		let payment_hash = PaymentHash::from(sha256::Hash::hash(&[0x42; 32]));
+		let expiry = BlockHeight::new(1_000);
+		let attestation = LightningReceiveClaimAttestation::new(payment_hash, expiry, &DUMMY_USER_KEY);
+		encoding_roundtrip(&attestation);
+		attestation.verify(payment_hash, expiry, DUMMY_USER_KEY.public_key())
+			.expect("verification failed");
+
+		// it binds the expiry, the payment and the key
+		attestation.verify(payment_hash, BlockHeight::new(1_001), DUMMY_USER_KEY.public_key())
+			.expect_err("other expiry");
+		let other_hash = PaymentHash::from(sha256::Hash::hash(&[0x43; 32]));
+		attestation.verify(other_hash, expiry, DUMMY_USER_KEY.public_key())
+			.expect_err("other payment");
+		let other_key = Keypair::from_secret_key(&SECP, &secp256k1::SecretKey::from_slice(&[7; 32]).unwrap());
+		attestation.verify(payment_hash, expiry, other_key.public_key())
+			.expect_err("other key");
 	}
 
 	#[test]
@@ -597,5 +769,45 @@ mod tests {
 		let hardcoded = OffboardRequestAttestation::deserialize_hex(&vector)
 			.expect("valid attestation");
 		hardcoded.verify(&offboard_req, &inputs, &vtxo).expect("hardcoded verification failed");
+	}
+
+	#[test]
+	fn test_round_participation_status_attestation() {
+		let unlock_hash = UnlockHash::hash(&[0x42; 32]);
+		let mailbox_id = MailboxIdentifier::from_pubkey(DUMMY_USER_KEY.public_key());
+		let attestation = RoundParticipationStatusAttestation::new(unlock_hash, &DUMMY_USER_KEY);
+		println!("RoundParticipationStatusAttestation hex: {}", attestation.serialize().as_hex());
+		encoding_roundtrip(&attestation);
+		attestation.verify(unlock_hash, mailbox_id).expect("verification failed");
+
+		let other_hash = UnlockHash::hash(&[0x43; 32]);
+		attestation.verify(other_hash, mailbox_id).expect_err("bound to the unlock hash");
+
+		// Hard-coded attestation test
+		let vector = "4378c88a6bed1984b99d7c14312d3b8a41b77e3519536bce3976f153e66e7be2f811fb0267d2ca1ed756793088ed871751a6b07791e29741bec34046c6fddb59";
+		let hardcoded = RoundParticipationStatusAttestation::deserialize_hex(&vector)
+			.expect("valid attestation");
+		hardcoded.verify(unlock_hash, mailbox_id).expect("hardcoded verification failed");
+	}
+
+	#[test]
+	fn test_forfeit_nonces_attestation() {
+		let spec = DummyTestVtxoSpec::default();
+		let (_tx, vtxo) = spec.build();
+
+		let unlock_hash = UnlockHash::hash(&[0x42; 32]);
+		let attestation = ForfeitNoncesAttestation::new(unlock_hash, vtxo.id(), &DUMMY_USER_KEY);
+		println!("ForfeitNoncesAttestation hex: {}", attestation.serialize().as_hex());
+		encoding_roundtrip(&attestation);
+		attestation.verify(unlock_hash, &vtxo).expect("verification failed");
+
+		let other_hash = UnlockHash::hash(&[0x43; 32]);
+		attestation.verify(other_hash, &vtxo).expect_err("bound to the unlock hash");
+
+		// Hard-coded attestation test
+		let vector = "1c7bea6d769abf1d33db6ad0f90409c177ad05c7bb2b7f4cbf0f1aaf149263db1d593145933331f1d75165782674dc30f1bb4d94d82c284d0e4de86f5ddc4334";
+		let hardcoded = ForfeitNoncesAttestation::deserialize_hex(&vector)
+			.expect("valid attestation");
+		hardcoded.verify(unlock_hash, &vtxo).expect("hardcoded verification failed");
 	}
 }

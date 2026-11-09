@@ -237,6 +237,19 @@ pub enum ValidateIssuanceError {
 }
 
 impl Invoice {
+	/// Relative expiry encoded by either invoice format.
+	pub fn expiry_time(&self) -> std::time::Duration {
+		match self {
+			Self::Bolt11(invoice) => invoice.expiry_time(),
+			Self::Bolt12(invoice) => invoice.relative_expiry(),
+		}
+	}
+
+	pub fn is_expired(&self) -> bool {
+		self.expired_at(std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+	}
+
 	/// Leave time to check a route and sign the HTLC before expiry.
 	pub fn has_send_lifetime(&self, now: std::time::Duration) -> bool {
 		now.checked_add(std::time::Duration::from_secs(30))

@@ -32,7 +32,7 @@ jobs:
           tags: ghcr.io/connorslab/paperclip-asp:candidate-${{ github.sha }}
           build-args: |
             GIT_HASH=${{ github.sha }}
-            SERVER_VERSION=0.0.0-beta
+            SERVER_VERSION=0.10.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Verify native executables

@@ -29,6 +29,16 @@ pub struct ClaimDeadlineExceeded {
 }
 impl_slog!(ClaimDeadlineExceeded, WARN, "claim deadline exceeded");
 
+/// A VTXO we must claim is still unspent close to the deadline after which
+/// the counterparty can spend it too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimDeadlineApproaching {
+	pub vtxo_id: VtxoId,
+	pub deadline: BlockHeight,
+	pub current_height: BlockHeight,
+}
+impl_slog!(ClaimDeadlineApproaching, ERROR, "claim still unconfirmed close to its deadline");
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressDeadlineExceeded {
 	pub vtxo_id: VtxoId,
@@ -135,3 +145,63 @@ pub struct ProgressBroadcast {
 	pub vtxo_id: VtxoId,
 }
 impl_slog!(ProgressBroadcast, INFO, "Broadcast progress transaction with CPFP");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierRepairedConfirmation {
+	pub vtxo_id: VtxoId,
+	pub height: BlockHeight,
+}
+impl_slog!(FrontierRepairedConfirmation, INFO, "Repaired missed confirmation of a frontier VTXO");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierClearedConfirmation {
+	pub vtxo_id: VtxoId,
+	/// The stale height that was stored.
+	pub height: BlockHeight,
+}
+impl_slog!(FrontierClearedConfirmation, WARN, "Cleared stale confirmation of a frontier VTXO whose tx is no longer confirmed");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierClearedSpend {
+	pub vtxo_id: VtxoId,
+	pub spending_txid: Txid,
+	/// The stale height that was stored.
+	pub height: BlockHeight,
+}
+impl_slog!(FrontierClearedSpend, WARN, "Cleared stale on-chain spend of a VTXO whose spending tx is no longer confirmed");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierRepairedSpend {
+	pub vtxo_id: VtxoId,
+	pub spending_txid: Txid,
+	pub height: BlockHeight,
+}
+impl_slog!(FrontierRepairedSpend, INFO, "Repaired missed on-chain spend of a frontier VTXO");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierRepairedVtxo {
+	pub vtxo_id: VtxoId,
+	pub height: BlockHeight,
+}
+impl_slog!(FrontierRepairedVtxo, INFO, "Repaired missing frontier VTXO");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierUnresolvedSpend {
+	pub vtxo_id: VtxoId,
+}
+impl_slog!(FrontierUnresolvedSpend, WARN, "Frontier VTXO is spent on-chain but no spending tx was found");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierReindexComplete {
+	pub entries_checked: usize,
+	pub confirmations_repaired: usize,
+	pub confirmations_cleared: usize,
+	pub spends_cleared: usize,
+	pub spends_repaired: usize,
+	pub vtxos_added: usize,
+	pub funding_txs_added: usize,
+	pub funding_vtxos_added: usize,
+	pub unresolved_spends: usize,
+	pub blocks_scanned: usize,
+}
+impl_slog!(FrontierReindexComplete, INFO, "Finished reindexing the frontier");

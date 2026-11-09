@@ -436,6 +436,11 @@ impl BoardBuilder<state::ServerCanCosign> {
 		Ok(builder.to_state())
 	}
 
+	/// Returns the txid of the exit transaction.
+	pub fn exit_txid(&self) -> Txid {
+		self.exit_data.as_ref().expect("state invariant").txid
+	}
+
 	/// This method is used by the server to cosign the board request.
 	///
 	/// Returns `None` if utxo or user_pub_nonce field is not provided.

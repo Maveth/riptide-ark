@@ -61,6 +61,7 @@ pub const ATTRIBUTE_ROUND_STEP: &str = "round_step";
 pub const ATTRIBUTE_LIGHTNING_NODE_ID: &str = "lightning_node_id";
 pub const ATTRIBUTE_DIRECTION: &str = "direction";
 pub const ATTRIBUTE_LIGHTNING_SELF_PAYMENT: &str = "self_payment";
+pub const ATTRIBUTE_LIGHTNING_FAILURE_REASON: &str = "reason";
 
 /// Intra-Ark payments (`self_payment="true"`) are counted on both sides;
 /// filter `self_payment="false"` for real network volume.
@@ -262,8 +263,10 @@ pub const RPC_GRPC_STATUS_CODE: &str = opentelemetry_semantic_conventions::attri
 /// known clients ([SEEN_USER_AGENT_NAMES]) the effective dynamic budget is slightly
 /// smaller than this number.
 const MAX_USER_AGENT_NAMES: usize = 1024;
-/// Max length of an accepted user agent name. Longer names are rejected.
-const MAX_USER_AGENT_NAME_LEN: usize = 32;
+/// Max length of each user agent part. Longer parts are rejected.
+const MAX_USER_AGENT_PART_LEN: usize = 32;
+/// Max length of an entire user agent.
+pub const MAX_USER_AGENT_LEN: usize = MAX_USER_AGENT_PART_LEN * 2 + 1;
 
 /// Process-wide set of admitted `user_agent.name` label values. Pre-seeded with the
 /// canonical user agent names we ship (pure-Rust `bark` plus the per-binding flavors
@@ -285,37 +288,48 @@ static SEEN_USER_AGENT_NAMES: LazyLock<RwLock<HashSet<&'static str>>> = LazyLock
 	RwLock::new(s)
 });
 
-/// Parse a strict `<name>/<version>` user-agent value, borrowing the name slice.
-///
-/// Called on every request, so this is allocation-free. The schema is rigid:
-/// exactly one `/`, a non-empty name on the left, a non-empty version on the
-/// right. The name must be lowercase ASCII alphanumeric with optional `-`/`_`
-/// and no longer than [MAX_USER_AGENT_NAME_LEN]. We don't lowercase ourselves
-/// (that would allocate); uppercase names are rejected so misbehaving clients
-/// get a clear signal rather than silently bucketing as something else.
-pub(crate) fn parse_user_agent_name(raw: &str) -> Option<&str> {
-	let (name, version) = raw.split_once('/')?;
-	if name.is_empty() || version.is_empty() || name.len() > MAX_USER_AGENT_NAME_LEN {
-		return None;
+/// Parse and validate the user agent and return (name, version) pair
+pub(crate) fn parse_user_agent<'a>(raw: &'a str) -> Result<(&'a str, &'a str), &'static str> {
+	if raw.is_empty() {
+		return Err("empty");
+	}
+	if raw.len() > MAX_USER_AGENT_LEN {
+		return Err("too long");
+	}
+	if !raw.is_ascii() {
+		return Err("not ASCII");
+	}
+
+	let (name, version) = raw.split_once('/').ok_or("no slash present")?;
+
+	if name.is_empty() {
+		return Err("empty name part");
+	}
+	if name.len() > MAX_USER_AGENT_PART_LEN {
+		return Err("name part too long");
 	}
 	if !name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_')) {
-		return None;
+		return Err("invalid character in name part");
 	}
-	Some(name)
+
+	if version.is_empty() {
+		return Err("empty version part");
+	}
+	if version.len() > MAX_USER_AGENT_PART_LEN {
+		return Err("version part too long");
+	}
+
+	Ok((name, version))
 }
 
-/// Bucket a raw `x-user-agent` value into a stable `user_agent.name` telemetry label.
+/// Bucket a user agent name into a stable `user_agent.name` telemetry label.
 ///
-/// - `None` (header absent) -> `Ok("unknown")`.
-/// - Header present but malformed -> `Err(())`; the caller should reject the RPC.
+/// - Header present but malformed -> `unknown`; the middleware rejects such
+///   requests before they get here, so this is only a safety net.
 /// - Otherwise, the parsed name is admitted to [SEEN_USER_AGENT_NAMES] up to
 ///   [MAX_USER_AGENT_NAMES], returning the interned `&'static str`. Past the
 ///   cap further unique names collapse into `other`, bounding label cardinality.
-pub(crate) fn bucket_user_agent(raw: Option<&str>) -> &'static str {
-	let Some(raw) = raw else { return "unknown" };
-	// Validated by the middleware; malformed here is a bug, so degrade quietly.
-	let Some(name) = parse_user_agent_name(raw) else { return "unknown" };
-
+pub(crate) fn bucket_user_agent_name(name: &str) -> &'static str {
 	// Fast path: already admitted.
 	if let Some(&interned) = SEEN_USER_AGENT_NAMES.read().get(name) {
 		return interned;
@@ -349,6 +363,14 @@ pub(crate) fn bucket_user_agent(raw: Option<&str>) -> &'static str {
 	interned
 }
 
+/// Shorthand for parsing, validating and bucketing, falling back to "unknown".
+pub(crate) fn bucket_user_agent(raw_ua: &str) -> &'static str {
+	match parse_user_agent(raw_ua) {
+		Ok((name, _version)) => bucket_user_agent_name(name),
+		Err(_) => "unknown",
+	}
+}
+
 
 tokio::task_local! {
 	/// The raw, validated `x-user-agent` of the currently-serving RPC, or
@@ -373,7 +395,9 @@ pub fn current_user_agent() -> Option<Arc<str>> {
 /// underlying `&'static str` is bounded by [MAX_USER_AGENT_NAMES]. The only place
 /// narrowing is applied.
 pub fn current_user_agent_name() -> &'static str {
-	USER_AGENT.try_with(|ua| bucket_user_agent(ua.as_deref())).unwrap_or("unknown")
+	USER_AGENT.try_with(|ua| {
+		ua.as_deref().map(bucket_user_agent).unwrap_or("unknown")
+	}).unwrap_or("unknown")
 }
 
 /// The global open-telemetry context to register metrics.
@@ -445,6 +469,7 @@ struct Metrics {
 	unilateral_exit_counter: Counter<u64>,
 	unilateral_exit_volume: Counter<u64>,
 	lightning_payment_sync_counter: Counter<u64>,
+	lightning_routing_budget_utilisation_ppm: Histogram<u64>,
 	lightning_payment_sync_queue_gauge: Gauge<u64>,
 	lightning_open_invoices_gauge: Gauge<u64>,
 	vtxo_pool_expiry_blocks_bucket_gauge: Gauge<u64>,
@@ -586,6 +611,7 @@ impl Metrics {
 		let registry = tracing_subscriber::registry()
 			.with(filter)
 			.with(server_log::slog_json_layer(std::io::stdout))
+			.with(server_log::InheritedFieldsLayer)
 			.with(tracing_opentelemetry::layer().with_tracer(tracer));
 
 		// Spawns the console-subscriber server (default 127.0.0.1:6669) and
@@ -695,6 +721,15 @@ impl Metrics {
 			.with_unit("sat")
 			.build();
 		let lightning_payment_sync_counter = meter.u64_counter("lightning_payment_sync_counter").build();
+		let lightning_routing_budget_utilisation_ppm =
+			meter.u64_histogram("lightning_routing_budget_utilisation_ppm")
+				// Fraction of the budget; 1M ppm is all of it.
+				.with_boundaries(vec![
+					0.0, 50_000.0, 100_000.0, 200_000.0, 300_000.0,
+					400_000.0, 500_000.0, 600_000.0, 700_000.0,
+					800_000.0, 900_000.0, 950_000.0, 1_000_000.0,
+				])
+				.build();
 		let lightning_payment_sync_queue_gauge = meter.u64_gauge("lightning_payment_sync_queue_gauge").build();
 		let lightning_open_invoices_gauge = meter.u64_gauge("lightning_open_invoices_gauge").build();
 		// Prometheus-histogram-shaped view of the VTXO pool by blocks-until-expiry.
@@ -844,6 +879,7 @@ impl Metrics {
 			unilateral_exit_counter,
 			unilateral_exit_volume,
 			lightning_payment_sync_counter,
+			lightning_routing_budget_utilisation_ppm,
 			lightning_payment_sync_queue_gauge,
 			lightning_open_invoices_gauge,
 			vtxo_pool_expiry_blocks_bucket_gauge,
@@ -936,7 +972,8 @@ const ALLOWED_BARK_VERSIONS: &[&str] = &[
 	"0.1.0", "0.1.1", "0.1.2", "0.1.3", "0.1.4",
 	"0.2.0", "0.2.1", "0.2.2", "0.2.3", "0.2.4",
 	"0.2.5", "0.3.0", "0.4.0", "0.5.0", "0.6.0",
-	"0.6.1", "0.6.2", "0.7.0", "0.7.1",
+	"0.6.1", "0.6.2", "0.7.0", "0.7.1", "0.8.0",
+	"0.8.1",
 ];
 
 // Compile-time check: the workspace version must be in
@@ -1146,7 +1183,7 @@ pub fn add_round(input_volume: Amount) {
 /// (board/LN) are excluded; those are counted by their own metrics.
 ///
 /// `user_agent_name` is the bucketed user agent name captured at SubmitPayment RPC
-/// time (see [bucket_user_agent]) and stashed on the
+/// time (see [bucket_user_agent_name]) and stashed on the
 /// [`crate::round::InteractiveParticipation`] until the round finalizes.
 /// We can't read `current_user_agent_name()` here because emission happens on the
 /// round-processing task, not on any user's RPC task.
@@ -1391,15 +1428,6 @@ pub fn add_arkoor_payment(volume_sats: u64) {
 	}
 }
 
-/// The `user_agent.name` label value for a lightning payment. The stored value is
-/// the raw `x-user-agent`, so it goes through [bucket_user_agent] like every other
-/// producer of this label: the raw string is client-controlled and carries a
-/// version, and both would make the label unbounded. Attempts stored before
-/// V66 carry no client and bucket as `"unknown"`.
-fn lightning_payment_user_agent_name(user_agent: Option<&str>) -> &'static str {
-	bucket_user_agent(user_agent)
-}
-
 /// The `user_agent.name` label comes from the payment attempt row, not from
 /// [current_user_agent_name]: most transitions are emitted by the xpay monitor, off the
 /// initiating RPC task. `None` (a pre-V66 attempt) is reported as `"unknown"`.
@@ -1410,19 +1438,29 @@ pub fn add_lightning_payment(
 	direction: LightningDirection,
 	is_self_payment: bool,
 	user_agent: Option<&str>,
+	failure: Option<crate::ln::LightningFailureKind>,
+	utilisation_ppm: Option<u64>,
 ) {
 	if let Some(m) = TELEMETRY.get() {
-		let user_agent_name = lightning_payment_user_agent_name(user_agent);
+		let user_agent_name = user_agent.map(bucket_user_agent).unwrap_or("unknown");
 
-		let attrs = m.with_global_labels([
+		let mut attrs = m.with_global_labels([
 			KeyValue::new(ATTRIBUTE_LIGHTNING_NODE_ID, lightning_node_id.to_string()),
 			KeyValue::new(ATTRIBUTE_STATUS, status.as_str()),
 			KeyValue::new(ATTRIBUTE_DIRECTION, direction.as_str()),
 			KeyValue::new(ATTRIBUTE_LIGHTNING_SELF_PAYMENT, is_self_payment),
 			KeyValue::new(USER_AGENT_NAME, user_agent_name),
 		]);
+		// Only on failures, so success and receive series keep the label set
+		// they have today.
+		if let Some(kind) = failure {
+			attrs.push(KeyValue::new(ATTRIBUTE_LIGHTNING_FAILURE_REASON, kind.as_str()));
+		}
 		m.lightning_payment_counter.add(1, &attrs);
 		m.lightning_payment_volume.add(amount_msat / 1000, &attrs);
+		if let Some(ppm) = utilisation_ppm {
+			m.lightning_routing_budget_utilisation_ppm.record(ppm, &attrs);
+		}
 	}
 }
 
@@ -1967,23 +2005,6 @@ mod tests {
 	}
 
 	#[test]
-	fn lightning_payment_user_agent_preserves_the_initiating_client() {
-		// The label is taken from the payment attempt row, so a transition
-		// emitted by the xpay monitor (off the initiating RPC task) must
-		// still carry the client that started the payment. The stored value
-		// is raw, so it buckets the same way current_user_agent_name() does.
-		assert_eq!(lightning_payment_user_agent_name(Some("bark-wasm/1.0")), "bark-wasm");
-		assert_eq!(lightning_payment_user_agent_name(Some("bark/0.2.3")), "bark");
-	}
-
-	#[test]
-	fn lightning_payment_user_agent_falls_back_to_unknown() {
-		// Pre-V66 attempts have no client. They must land in the "unknown"
-		// bucket; renaming it would split existing dashboards in two.
-		assert_eq!(lightning_payment_user_agent_name(None), "unknown");
-	}
-
-	#[test]
 	fn ark_fee_op_labels_are_stable() {
 		// These strings are emitted as Prometheus label values; renaming
 		// them would silently break existing dashboards / alerts.
@@ -2000,39 +2021,62 @@ mod user_agent_bucketing_tests {
 	use super::*;
 
 	#[test]
-	fn parse_user_agent_name_accepts_schema() {
-		assert_eq!(parse_user_agent_name("bark/0.2.3"), Some("bark"));
-		assert_eq!(parse_user_agent_name("my-wallet/1.0"), Some("my-wallet"));
-		assert_eq!(parse_user_agent_name("my_wallet/1.0"), Some("my_wallet"));
+	fn parse_user_agent_accepts_schema() {
+		assert_eq!(parse_user_agent("bark/0.2.3"), Ok(("bark", "0.2.3")));
+		assert_eq!(parse_user_agent("my-wallet/1.0"), Ok(("my-wallet", "1.0")));
+		assert_eq!(parse_user_agent("my_wallet/1.0"), Ok(("my_wallet", "1.0")));
 		// Versions with extra `/` or `-` are kept opaque on the right side.
-		assert_eq!(parse_user_agent_name("bark/0.2.3-DIRTY"), Some("bark"));
+		assert_eq!(parse_user_agent("bark/0.2.3-DIRTY"), Ok(("bark", "0.2.3-DIRTY")));
+		assert_eq!(parse_user_agent("bark/0.2.3/extra"), Ok(("bark", "0.2.3/extra")));
+		// Both parts at their maximum length.
+		let name = "a".repeat(MAX_USER_AGENT_PART_LEN);
+		let version = "1".repeat(MAX_USER_AGENT_PART_LEN);
+		let max = format!("{}/{}", name, version);
+		assert_eq!(max.len(), MAX_USER_AGENT_LEN);
+		assert_eq!(parse_user_agent(&max), Ok((name.as_str(), version.as_str())));
 	}
 
 	#[test]
-	fn parse_user_agent_name_rejects_violations() {
+	fn parse_user_agent_rejects_violations() {
 		// Missing or empty halves.
-		assert_eq!(parse_user_agent_name(""), None);
-		assert_eq!(parse_user_agent_name("bark"), None);
-		assert_eq!(parse_user_agent_name("bark/"), None);
-		assert_eq!(parse_user_agent_name("/0.2.3"), None);
+		assert_eq!(parse_user_agent(""), Err("empty"));
+		assert_eq!(parse_user_agent("bark"), Err("no slash present"));
+		assert_eq!(parse_user_agent("bark/"), Err("empty version part"));
+		assert_eq!(parse_user_agent("/0.2.3"), Err("empty name part"));
 		// Uppercase in the name (we don't lowercase to stay allocation-free).
-		assert_eq!(parse_user_agent_name("Bark/0.2.3"), None);
+		assert_eq!(parse_user_agent("Bark/0.2.3"), Err("invalid character in name part"));
 		// Invalid characters in the name.
-		assert_eq!(parse_user_agent_name("bark!/0.2.3"), None);
-		assert_eq!(parse_user_agent_name(" bark/0.2.3"), None);
-		// Name too long.
-		let long = format!("{}/1.0", "a".repeat(MAX_USER_AGENT_NAME_LEN + 1));
-		assert_eq!(parse_user_agent_name(&long), None);
+		assert_eq!(parse_user_agent("bark!/0.2.3"), Err("invalid character in name part"));
+		assert_eq!(parse_user_agent(" bark/0.2.3"), Err("invalid character in name part"));
+		// Non-ASCII anywhere, also in the otherwise opaque version.
+		assert_eq!(parse_user_agent("bärk/0.2.3"), Err("not ASCII"));
+		assert_eq!(parse_user_agent("bark/0.2.3-é"), Err("not ASCII"));
+	}
+
+	#[test]
+	fn parse_user_agent_rejects_oversized_parts() {
+		// Name too long, within the total budget.
+		let long = format!("{}/1.0", "a".repeat(MAX_USER_AGENT_PART_LEN + 1));
+		assert_eq!(parse_user_agent(&long), Err("name part too long"));
+		// Version too long, within the total budget.
+		let long = format!("bark/{}", "1".repeat(MAX_USER_AGENT_PART_LEN + 1));
+		assert_eq!(parse_user_agent(&long), Err("version part too long"));
+		// Over the total budget: rejected before any part is inspected.
+		let long = format!("{}/{}",
+			"a".repeat(MAX_USER_AGENT_PART_LEN), "1".repeat(MAX_USER_AGENT_PART_LEN + 1),
+		);
+		assert_eq!(long.len(), MAX_USER_AGENT_LEN + 1);
+		assert_eq!(parse_user_agent(&long), Err("too long"));
 	}
 
 	#[test]
 	fn bucket_user_agent_classifies_inputs() {
-		assert_eq!(bucket_user_agent(None), "unknown");
-		assert_eq!(bucket_user_agent(Some("bark/0.2.3")), "bark");
+		assert_eq!(bucket_user_agent(""), "unknown");
+		assert_eq!(bucket_user_agent("bark/0.2.3"), "bark");
 		// Malformed agents never reach bucket_user_agent -- the middleware rejects
 		// them -- so they degrade to `unknown` rather than erroring.
-		assert_eq!(bucket_user_agent(Some("bark")), "unknown");
-		assert_eq!(bucket_user_agent(Some("")), "unknown");
-		assert_eq!(bucket_user_agent(Some("Bark/0.2.3")), "unknown");
+		assert_eq!(bucket_user_agent("bark"), "unknown");
+		assert_eq!(bucket_user_agent(""), "unknown");
+		assert_eq!(bucket_user_agent("Bark/0.2.3"), "unknown");
 	}
 }

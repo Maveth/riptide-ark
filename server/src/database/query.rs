@@ -8,16 +8,21 @@ use bitcoin::hex::FromHex;
 /// transaction if that is required.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::str::FromStr;
 
 use anyhow::Context;
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Amount, Txid};
+use postgres_types::{IsNull, ToSql};
+use postgres_types::private::BytesMut;
 use tokio_postgres::{Row, Transaction as PgTransaction};
 use tokio_postgres::types::Type;
+use tokio_util::bytes::BufMut;
 
-use ark::{ProtocolEncoding, ServerVtxoPolicy, VtxoId, VtxoRequest};
+use ark::{ProtocolEncoding, ServerVtxoPolicy, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::mailbox::MailboxIdentifier;
 use ark::rounds::RoundId;
 use ark::tree::signed::{UnlockHash, UnlockPreimage};
@@ -28,6 +33,31 @@ use crate::database::model::{VirtualTransaction, VtxoState};
 use crate::database::rounds::{StoredRoundInput, StoredRoundOutput, StoredRoundParticipation};
 use crate::error::ContextExt;
 use crate::secret::Secret;
+
+
+/// Binds a [ProtocolEncoding] value as a `bytea` query parameter.
+///
+/// The value is encoded straight into the parameter buffer, so a slice of
+/// these binds as a `bytea[]` without serializing each element up front.
+#[derive(Debug)]
+pub struct ProtocolEncodedSql<'a, T>(pub &'a T);
+
+impl<'a, T: ProtocolEncoding + fmt::Debug> ToSql for ProtocolEncodedSql<'a, T> {
+	fn to_sql(
+		&self,
+		_ty: &Type,
+		out: &mut BytesMut,
+	) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+		self.0.encode(&mut out.writer())?;
+		Ok(IsNull::No)
+	}
+
+	fn accepts(ty: &Type) -> bool {
+		*ty == Type::BYTEA
+	}
+
+	postgres_types::to_sql_checked!();
+}
 
 
 pub async fn get_virtual_transaction_by_txid(
@@ -95,14 +125,13 @@ pub async fn get_vtxo_by_id(
 	Ok(VtxoState::try_from(row)?)
 }
 
-/// Get vtxos by id and ensure the order of the returned vtxos matches
-/// the order of the provided ids
+/// Get the vtxos that exist among the given ids, keyed by id.
 ///
-/// This function returns [ServerVtxo]s
-pub async fn get_vtxos_by_id(
+/// Unknown ids are left out. Duplicate ids yield one entry.
+pub async fn get_existing_vtxos_by_id(
 	tx: &PgTransaction<'_>,
 	ids: &[VtxoId],
-) -> anyhow::Result<Vec<VtxoState<Full, ServerVtxoPolicy>>>
+) -> anyhow::Result<HashMap<VtxoId, VtxoState<Full, ServerVtxoPolicy>>>
 {
 	let statement = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
@@ -113,16 +142,27 @@ pub async fn get_vtxos_by_id(
 
 	let id_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
 	let rows = tx.query(&statement, &[&id_str]).await
-		.context("Query get_vtxos_by_id failed")?;
+		.context("Query get_existing_vtxos_by_id failed")?;
 
-	// Parse all rows
-	let mut vtxos = rows.into_iter()
+	rows.into_iter()
 		.map(|row| {
 			let vtxo = VtxoState::try_from(row)?;
 			Ok((vtxo.vtxo.id(), vtxo))
 		})
 		.collect::<anyhow::Result<HashMap<_, _>>>()
-		.context("Failed to parse VtxoState from database")?;
+		.context("Failed to parse VtxoState from database")
+}
+
+/// Get vtxos by id and ensure the order of the returned vtxos matches
+/// the order of the provided ids
+///
+/// This function returns [ServerVtxo]s
+pub async fn get_vtxos_by_id(
+	tx: &PgTransaction<'_>,
+	ids: &[VtxoId],
+) -> anyhow::Result<Vec<VtxoState<Full, ServerVtxoPolicy>>>
+{
+	let mut vtxos = get_existing_vtxos_by_id(tx, ids).await?;
 
 	// Bail if one of the id's could not be found
 	if vtxos.len() != ids.len() {
@@ -131,6 +171,64 @@ pub async fn get_vtxos_by_id(
 	}
 
 	Ok(ids.iter().map(|id| vtxos.remove(id).unwrap()).collect())
+}
+
+/// A page of the VTXOs owned by `policy`, whatever their spend state.
+///
+/// The page holds at most `limit` VTXOs ordered by id, starting after the
+/// VTXO `after` when given.
+///
+/// The pagination doesn't take into account new VTXOs sent to the policy
+/// between 2 requests. We assume it is unlikely to happen in the context
+/// of a recovery.
+pub async fn get_vtxos_by_policy_page(
+	tx: &PgTransaction<'_>,
+	policy: &VtxoPolicy,
+	after: Option<VtxoId>,
+	limit: usize,
+) -> anyhow::Result<Vec<VtxoState<Full, ServerVtxoPolicy>>> {
+	let statement = tx.prepare_typed("
+		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
+			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at
+		FROM vtxo
+		WHERE policy = $1 AND ($2::TEXT IS NULL OR vtxo_id > $2)
+		ORDER BY vtxo_id
+		LIMIT $3;
+	", &[Type::BYTEA, Type::TEXT, Type::INT8]).await?;
+
+	let after = after.map(|id| id.to_string());
+	let limit = i64::try_from(limit).context("page limit too large")?;
+	let rows = tx.query(&statement, &[&ProtocolEncodedSql(policy), &after, &limit]).await
+		.context("Query get_vtxos_by_policy_page failed")?;
+
+	rows.into_iter()
+		.map(VtxoState::try_from)
+		.collect::<anyhow::Result<Vec<_>>>()
+		.context("Failed to parse VtxoState from database")
+}
+
+/// The given policies that own at least one VTXO, whatever its spend state.
+///
+/// This probes the policy index once per policy and reads no VTXO rows, so
+/// its cost doesn't grow with the number of VTXOs of a policy.
+pub async fn get_used_vtxo_policies(
+	tx: &PgTransaction<'_>,
+	policies: &[VtxoPolicy],
+) -> anyhow::Result<Vec<VtxoPolicy>> {
+	let statement = tx.prepare_typed("
+		SELECT p.policy
+		FROM unnest($1::bytea[]) AS p(policy)
+		CROSS JOIN LATERAL (SELECT 1 FROM vtxo WHERE vtxo.policy = p.policy LIMIT 1) AS used;
+	", &[Type::BYTEA_ARRAY]).await?;
+
+	let params = policies.iter().map(ProtocolEncodedSql).collect::<Vec<_>>();
+	let rows = tx.query(&statement, &[&params]).await
+		.context("Query get_used_vtxo_policies failed")?;
+
+	rows.into_iter()
+		.map(|row| Ok(VtxoPolicy::deserialize(row.get::<_, &[u8]>("policy"))?))
+		.collect::<anyhow::Result<Vec<_>>>()
+		.context("Failed to parse VtxoPolicy from database")
 }
 
 /// Get a bare VTXO by id, constructed from the metadata columns
@@ -166,6 +264,12 @@ pub async fn store_round_participation(
 	outputs: impl IntoIterator<Item = &StoredRoundOutput>,
 	scheduled_height: Option<BlockHeight>,
 ) -> anyhow::Result<()> {
+	// The column is an INTEGER, so a larger height would wrap negative.
+	let scheduled_height = scheduled_height
+		.map(|h| i32::try_from(h.to_u32())
+			.map_err(|_| badarg_err!("scheduled height {} is out of range", h)))
+		.transpose()?;
+
 	let part_stmt = tx.prepare_typed(
 		"INSERT INTO round_participation \
 			(unlock_hash, unlock_preimage, scheduled_height, created_at) \
@@ -176,7 +280,7 @@ pub async fn store_round_participation(
 	let part_row = tx.query_one(&part_stmt, &[
 		&unlock_hash.to_string(),
 		&unlock_preimage.to_lower_hex_string(),
-		&scheduled_height.map(|h| h.to_u32() as i32),
+		&scheduled_height,
 	]).await?;
 
 	let part_id = part_row.get::<_, i64>("id");
@@ -227,7 +331,10 @@ pub async fn delete_pending_participations_for_inputs(
 			WHERE rp.round_id IS NULL AND rpi.vtxo_id = ANY($1)
 		),
 		deleted AS (
-			DELETE FROM round_participation WHERE id IN (SELECT id FROM stale) RETURNING id
+			-- recheck: a concurrent finish_round may have assigned it meanwhile
+			DELETE FROM round_participation
+			WHERE id IN (SELECT id FROM stale) AND round_id IS NULL
+			RETURNING id
 		),
 		_inputs AS (
 			DELETE FROM round_part_input WHERE participation_id IN (SELECT id FROM deleted)
@@ -299,13 +406,13 @@ pub async fn complete_round_participation(
 	let unlock_hash = UnlockHash::from_str(&part_row.get::<_, &str>("unlock_hash"))
 		.context("invalid unlock_hash")?;
 	ensure!(UnlockHash::hash(&unlock_preimage) == unlock_hash,
-		"unlock_hash ({}) does not match unlock_preimage ({})",
-		unlock_hash, unlock_preimage.as_hex(),
+		"unlock_preimage does not match unlock_hash {}", unlock_hash,
 	);
 
 	let forfeited_at = part_row.get::<_, Option<chrono::DateTime<chrono::Local>>>("forfeited_at");
 	let scheduled_height = part_row.get::<_, Option<i32>>("scheduled_height")
-		.map(|h| BlockHeight::try_from(h).expect("invalid block height in db"));
+		.map(|h| BlockHeight::try_from(h).context("invalid scheduled_height in db"))
+		.transpose()?;
 
 	Ok(StoredRoundParticipation {
 		unlock_preimage: Secret::new(unlock_preimage),

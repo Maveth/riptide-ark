@@ -5,6 +5,7 @@ use anyhow::Context;
 use bitcoin::secp256k1::Keypair;
 
 use ark::{musig, VtxoId};
+use ark::attestations::ForfeitNoncesAttestation;
 use ark::forfeit::HashLockedForfeitBundle;
 use ark::tree::signed::{UnlockHash, UnlockPreimage};
 
@@ -43,7 +44,26 @@ impl Server {
 		&self,
 		unlock_hash: UnlockHash,
 		vtxos: &[VtxoId],
+		attestations: &[ForfeitNoncesAttestation],
 	) -> anyhow::Result<Vec<musig::PublicNonce>> {
+		// check ownership before anything that depends on the participation,
+		// so only the owner learns whether the inputs belong to this hash
+		if attestations.is_empty() {
+			if self.config.forfeit_attestation_required {
+				return badarg!("forfeit nonce requests need an attestation for each vtxo");
+			}
+		} else {
+			if attestations.len() != vtxos.len() {
+				return badarg!("expected {} attestations, got {}", vtxos.len(), attestations.len());
+			}
+			let states = self.db.read(async |t| t.get_user_vtxos_by_id(vtxos).await).await?;
+			for (state, attestation) in states.iter().zip(attestations) {
+				if attestation.verify(unlock_hash, &state.vtxo).is_err() {
+					return badarg!("invalid attestation for vtxo {}", state.vtxo_id);
+				}
+			}
+		}
+
 		// only generate nonces for the inputs of the round participation with
 		// the given unlock hash, so that this endpoint can't be used to burn
 		// CPU on unbounded nonce generation
@@ -65,6 +85,18 @@ impl Server {
 			}
 		}
 
+		// an input that exited onchain can't be forfeited anymore, see
+		// register_vtxo_forfeit. a forfeited participation is exempt so the
+		// retry described above keeps working after the forfeit confirmed
+		if part.forfeited_at.is_none() {
+			let states = self.db.read(async |t| t.get_user_vtxos_by_id(vtxos).await).await?;
+			for state in &states {
+				if state.is_exited() {
+					return badarg!("vtxo {} has exited onchain", state.vtxo_id);
+				}
+			}
+		}
+
 		let mut ret = Vec::with_capacity(vtxos.len());
 		for vtxo in vtxos {
 			// if we still hold nonces for this vtxo (e.g. the request was
@@ -82,8 +114,22 @@ impl Server {
 			// nb this call is quite expensive computationally, so we don't want to
 			// keep the lock while doing it
 			let nonces = HarkForfeitNonces::generate(self.server_key.leak_ref(), unlock_hash);
-			ret.push(nonces.public_nonce());
-			self.forfeit_nonces.lock().insert_some(*vtxo, nonces);
+
+			// A concurrent request may have stored nonces meanwhile. Hand out
+			// those rather than overwrite them, so every caller gets the nonce
+			// whose secret the server keeps.
+			let mut stored = self.forfeit_nonces.lock();
+			let concurrent = stored.get(vtxo)
+				.and_then(|opt| opt.as_ref())
+				.filter(|n| n.unlock_hash == unlock_hash)
+				.map(|n| n.public_nonce());
+			match concurrent {
+				Some(pub_nonce) => ret.push(pub_nonce),
+				None => {
+					ret.push(nonces.public_nonce());
+					stored.insert_some(*vtxo, nonces);
+				},
+			}
 		}
 		Ok(ret)
 	}
@@ -112,6 +158,19 @@ impl Server {
 
 		let unlock_hash = unlock_hash.badarg("zero forfeit bundles provided")?;
 
+		// nonces are only handed out against the participation, so without
+		// them nothing below may tell the caller anything about it
+		{
+			let nonces = self.forfeit_nonces.lock();
+			for id in &vtxo_ids {
+				let generated = nonces.get(id).and_then(|n| n.as_ref())
+					.is_some_and(|n| n.unlock_hash == unlock_hash);
+				if !generated {
+					return badarg!("no forfeit nonces generated for vtxo {}", id);
+				}
+			}
+		}
+
 		// fetch all input vtxos and round participation in a single transaction
 		let (vtxos, part) = self.db.read(async |t| {
 			let vtxos = t.get_user_vtxos_by_id(&vtxo_ids).await?;
@@ -135,7 +194,16 @@ impl Server {
 			}
 		}
 		if !input_set.is_empty() {
-			return badarg!("missing input vtxos: {:?}", input_set);
+			return badarg!("missing input vtxos");
+		}
+
+		// an input that exited onchain can be taken by its owner through the
+		// exit clause once the exit delta passed, so a forfeit of it may never
+		// confirm. refuse it rather than release the unlock preimage
+		for vtxo in &vtxos {
+			if vtxo.is_exited() {
+				return badarg!("vtxo {} has exited onchain", vtxo.vtxo_id);
+			}
 		}
 
 		// then do the expensive verification and create final sigs
@@ -143,25 +211,54 @@ impl Server {
 		let mut ff_txids = Vec::with_capacity(forfeits.len());
 		let mut ff_vtxos = Vec::with_capacity(forfeits.len());
 		let mut input_forfeit_pairs = Vec::with_capacity(forfeits.len());
+		// Verify every bundle before consuming any nonce, so an invalid bundle,
+		// which anyone knowing the participation can send, uses up none of them.
+		let mut pub_nonces = Vec::with_capacity(forfeits.len());
 		for (vtxo_ff, vtxo) in forfeits.iter().zip(&vtxos) {
+			let pub_nonce = {
+				let nonces = self.forfeit_nonces.lock();
+				let nonces = nonces.get(&vtxo_ff.vtxo_id).and_then(|n| n.as_ref()).with_badarg(||
+					format!("no forfeit nonces generated for vtxo {}", vtxo_ff.vtxo_id),
+				)?;
+				if nonces.unlock_hash != unlock_hash {
+					return badarg!("forfeit nonces were generated for unlock hash {} instead of {}",
+						nonces.unlock_hash, unlock_hash,
+					);
+				}
+				nonces.public_nonce()
+			};
+			if let Err(e) = vtxo_ff.verify(&vtxo.vtxo, &pub_nonce) {
+				return badarg!("forfeit validation failed for vtxo {}: {}", vtxo_ff.vtxo_id, e);
+			}
+			pub_nonces.push(pub_nonce);
+		}
+
+		// Then consume them all at once, unless a concurrent request did first.
+		let sec_nonces = {
+			let mut nonces = self.forfeit_nonces.lock();
+			for (vtxo_ff, pub_nonce) in forfeits.iter().zip(&pub_nonces) {
+				let unchanged = nonces.get(&vtxo_ff.vtxo_id).and_then(|n| n.as_ref())
+					.is_some_and(|n| n.public_nonce() == *pub_nonce);
+				if !unchanged {
+					return badarg!("forfeit nonces for vtxo {} were used or replaced meanwhile",
+						vtxo_ff.vtxo_id,
+					);
+				}
+			}
+			forfeits.iter()
+				.map(|ff| nonces.take(&ff.vtxo_id).expect("checked above").into_secret_nonce())
+				.collect::<Vec<_>>()
+		};
+
+		for (((vtxo_ff, vtxo), pub_nonce), sec_nonce) in forfeits.iter().zip(&vtxos)
+			.zip(pub_nonces).zip(sec_nonces)
+		{
 			let input = part.inputs.iter().find(|i| i.vtxo_id == vtxo_ff.vtxo_id)
 				.expect("checked this before");
-			let nonces = self.forfeit_nonces.lock().take(&input.vtxo_id).with_badarg(||
-				format!("no forfeit nonces generated for vtxo {}", input.vtxo_id),
-			)?;
-			if nonces.unlock_hash != unlock_hash {
-				return badarg!("forfeit nonces were generated for unlock hash {} instead of {}",
-					nonces.unlock_hash, unlock_hash,
-				);
-			}
-			let pub_nonce = nonces.public_nonce();
-			if let Err(e) = vtxo_ff.verify(&vtxo.vtxo, &pub_nonce) {
-				return badarg!("forfeit validation failed for vtxo {}: {}", input.vtxo_id, e);
-			}
 			let (_ff_sig, ff_tx, ff_vtxo) = vtxo_ff.finish(
 				&vtxo.vtxo,
 				&pub_nonce,
-				nonces.into_secret_nonce(),
+				sec_nonce,
 				self.server_key.leak_ref(),
 			);
 			let ff_txid = ff_tx.compute_txid();

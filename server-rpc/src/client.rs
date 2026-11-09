@@ -35,7 +35,6 @@ use std::time::Duration;
 use bitcoin::{FeeRate, Network};
 use log::warn;
 use tokio::sync::RwLock;
-use tonic::codec::CompressionEncoding;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
@@ -264,6 +263,8 @@ pub enum ConnectError {
 	ProtocolVersionMismatchClientTooOld { client_max: u64, server_min: u64 },
 	#[error("version mismatch. Client min is: {client_min}, server max is: {server_max}")]
 	ProtocolVersionMismatchServerTooOld { client_min: u64, server_max: u64 },
+	#[error("invalid server protocol version range: {server_min}..={server_max}")]
+	InvalidProtocolVersionRange { server_min: u64, server_max: u64 },
 	#[error("error getting ark info: {0}")]
 	GetArkInfo(tonic::Status),
 	#[error("invalid ark info from ark server: {0}")]
@@ -486,18 +487,12 @@ impl ServerConnection {
 		let pver = check_handshake(handshake)?;
 		interceptor.pver = Some(pver);
 
-		// Advertise zstd so capable servers compress their responses; the
-		// savings are mostly on the response path. We only accept_compressed,
-		// never send_compressed: gRPC can't negotiate request-body compression,
-		// so the client leaves its own requests uncompressed.
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
-			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = client.ark_info(network).await?;
 
 		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
-			.accept_compressed(CompressionEncoding::Zstd)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
 		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));
@@ -572,6 +567,11 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 		warn!("Message from Ark server: \"{}\"", msg);
 	}
 
+	if handshake.min_protocol_version > handshake.max_protocol_version {
+		return Err(ConnectError::InvalidProtocolVersionRange {
+			server_min: handshake.min_protocol_version, server_max: handshake.max_protocol_version
+		});
+	}
 	if MAX_PROTOCOL_VERSION < handshake.min_protocol_version {
 		return Err(ConnectError::ProtocolVersionMismatchClientTooOld {
 			client_max: MAX_PROTOCOL_VERSION, server_min: handshake.min_protocol_version
@@ -583,16 +583,16 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 		});
 	}
 
+	// Both ranges are valid and overlap, so this is in both.
 	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
-	assert!((MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver));
-	assert!((handshake.min_protocol_version..=handshake.max_protocol_version).contains(&pver));
-
 	Ok(pver)
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use super::{check_handshake, CreateEndpointError, ConnectError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use crate::MAX_PROTOCOL_VERSION;
+	use crate::protos;
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {
@@ -600,5 +600,16 @@ mod tests {
 		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
 		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
 		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+	}
+
+	#[test]
+	fn handshake_rejects_inverted_protocol_range() {
+		let response = protos::HandshakeResponse {
+			min_protocol_version: MAX_PROTOCOL_VERSION,
+			max_protocol_version: MAX_PROTOCOL_VERSION - 1,
+			psa: None,
+		};
+		assert!(matches!(check_handshake(response),
+			Err(ConnectError::InvalidProtocolVersionRange { .. })));
 	}
 }

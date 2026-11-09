@@ -12,7 +12,7 @@ use ark::vtxo::policy::check_block_delta;
 use ark::arkoor::{ArkoorCosignRequest, ArkoorCosignResponse, ArkoorDestination};
 use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignResponse};
 use ark::attestations::{
-	ArkoorCosignAttestation, DelegatedRoundParticipationAttestation, LightningReceiveAttestation, OffboardRequestAttestation, RoundAttemptAttestation, VtxoStatusAttestation
+	ArkoorCosignAttestation, DelegatedRoundParticipationAttestation, ForfeitNoncesAttestation, LightningReceiveAttestation, OffboardRequestAttestation, RoundAttemptAttestation, RoundParticipationStatusAttestation, VtxoStatusAttestation
 };
 use ark::board::BoardCosignResponse;
 use ark::fees::PpmFeeRate;
@@ -101,6 +101,12 @@ impl_try_from_byte_slice!(schnorr::Signature, "Schnorr signature");
 impl_try_from_byte_slice!(VtxoId, "VTXO ID");
 impl_try_from_byte_slice!(RoundId, "VTXO ID");
 
+impl TryFromBytes for bitcoin::bip32::Xpub {
+	fn from_bytes<T: AsRef<[u8]>>(b: T) -> Result<Self, ConvertError> {
+		Ok(bitcoin::bip32::Xpub::decode(b.as_ref()).map_err(|_| "invalid xpub")?)
+	}
+}
+
 macro_rules! impl_try_from_bytes_protocol {
 	($ty:path, $exp:expr) => {
 		impl TryFromBytes for $ty {
@@ -124,6 +130,10 @@ impl_try_from_bytes_protocol!(DelegatedRoundParticipationAttestation,
 impl_try_from_bytes_protocol!(LightningReceiveAttestation, "lightning receive attestation");
 impl_try_from_bytes_protocol!(VtxoStatusAttestation, "VTXO status attestation");
 impl_try_from_bytes_protocol!(OffboardRequestAttestation, "offboard request attestation");
+impl_try_from_bytes_protocol!(RoundParticipationStatusAttestation,
+	"round participation status attestation"
+);
+impl_try_from_bytes_protocol!(ForfeitNoncesAttestation, "forfeit nonces attestation");
 
 macro_rules! impl_try_from_bytes_bitcoin {
 	($ty:path, $exp:expr) => {
@@ -682,6 +692,9 @@ impl<'a> TryFrom<protos::ArkoorPackageCosignRequest> for ArkoorPackageCosignRequ
 	type Error = ConvertError;
 
 	fn try_from(v: protos::ArkoorPackageCosignRequest) -> Result<Self, Self::Error> {
+		if v.parts.len() > crate::MAX_NB_VTXO_IDS {
+			return Err("too many parts in cosign request".into());
+		}
 		Ok(Self {
 			requests: v.parts.into_iter().map(|p| p.try_into()).collect::<Result<Vec<_>, _>>()?,
 		})
@@ -692,6 +705,9 @@ impl<'a> TryFrom<protos::LightningPayHtlcCosignRequest> for ArkoorPackageCosignR
 	type Error = ConvertError;
 
 	fn try_from(v: protos::LightningPayHtlcCosignRequest) -> Result<Self, Self::Error> {
+		if v.parts.len() > crate::MAX_NB_VTXO_IDS {
+			return Err("too many parts in cosign request".into());
+		}
 		Ok(Self {
 			requests: v.parts.into_iter().map(|p| p.try_into()).collect::<Result<Vec<_>, _>>()?,
 		})

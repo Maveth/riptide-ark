@@ -15,6 +15,14 @@ service ArkService {
 
 	rpc GetVtxo(GetVtxoRequest) returns (GetVtxoResponse) {}
 	rpc GetVtxoStatus(GetVtxoStatusRequest) returns (GetVtxoStatusResponse) {}
+	rpc GetVtxosByIds(GetVtxosByIdsRequest) returns (GetVtxosByIdsResponse) {}
+	rpc GetVtxosStatusByIds(GetVtxosStatusByIdsRequest) returns (GetVtxosStatusByIdsResponse) {}
+	// Seed recovery without the mailbox: lists the VTXOs, in any spend state,
+	// owned by the non-hardened children xpub/i of the given xpub, for i in
+	// [start_index, start_index + server-configured count), each with its
+	// body and spend state. The request is signed by the private key of the
+	// xpub.
+	rpc RecoverVtxosByXpub(RecoverVtxosByXpubRequest) returns (RecoverVtxosByXpubResponse) {}
 
 	// * BOARDING *
 
@@ -189,6 +197,19 @@ message GetVtxoResponse {
 	bytes vtxo = 1;
 }
 
+message GetVtxosByIdsRequest {
+	// The server rejects more than 1000 ids per request.
+	repeated bytes vtxo_ids = 1;
+}
+
+message GetVtxosByIdsResponse {
+	// Serialized VTXOs of the requested ids the server knows, in the order
+	// of the requested ids. An unknown id is skipped here and listed below.
+	repeated bytes vtxos = 1;
+	// Requested ids the server does not know, each once.
+	repeated bytes missing_vtxo_ids = 2;
+}
+
 // Client-relevant spend state for a user-owned VTXO.
 //
 // Server-internal states (pool, forfeit, connector) are never returned;
@@ -217,6 +238,69 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
+}
+
+message VtxoStatusQuery {
+	bytes vtxo_id = 1;
+	// Serialized VtxoStatusAttestation proving the user controls the VTXO.
+	bytes attestation = 2;
+}
+
+message GetVtxosStatusByIdsRequest {
+	// The server rejects more than 1000 entries per request.
+	repeated VtxoStatusQuery vtxos = 1;
+}
+
+message VtxoStatus {
+	bytes vtxo_id = 1;
+	VtxoSpendState spend_state = 2;
+}
+
+message GetVtxosStatusByIdsResponse {
+	// One entry per requested VTXO the server knows, in request order. An
+	// unknown id is skipped here and listed below.
+	repeated VtxoStatus vtxos = 1;
+	// Requested ids the server does not know, each once.
+	repeated bytes missing_vtxo_ids = 2;
+}
+
+message RecoverVtxosByXpubRequest {
+	// BIP-32 serialized extended public key (78 bytes). Children are
+	// derived as non-hardened xpub/i for i in
+	// [start_index, start_index + server-configured count).
+	bytes xpub = 1;
+	// First child index to scan, below 2^31. A wallet with more keys than
+	// one call scans continues where the previous call stopped.
+	uint32 start_index = 2;
+	// Serialized XpubRecoveryAuthorization, signed by the private key of the
+	// xpub for this server.
+	bytes authorization = 3;
+	// The cursor_vtxo_id of the previous response. The scan of the key at
+	// start_index then continues after this VTXO.
+	optional bytes cursor_vtxo_id = 4;
+}
+
+message RecoveredVtxo {
+	// The serialized VTXO.
+	bytes vtxo = 1;
+	// Child index of the xpub that owns the VTXO: its user pubkey is
+	// xpub/derivation_index.
+	uint32 derivation_index = 2;
+	VtxoSpendState spend_state = 3;
+}
+
+message RecoverVtxosByXpubResponse {
+	repeated RecoveredVtxo vtxos = 1;
+	// Number of child indices the server scanned in full, starting at
+	// start_index. A follow-up call continues at start_index + nb_keys_scanned.
+	// The server stops early once the response holds enough VTXOs.
+	uint32 nb_keys_scanned = 2;
+	// Set when more VTXOs may follow at higher indices
+	bool have_more = 3;
+	// Set when the server stopped inside the VTXOs of the key at
+	// start_index + nb_keys_scanned, to the id of the last VTXO returned
+	// for that key. A follow-up call passes it back as cursor_vtxo_id.
+	optional bytes cursor_vtxo_id = 4;
 }
 
 
@@ -308,6 +392,10 @@ message InitiateLightningPaymentRequest {
 	repeated bytes htlc_vtxo_ids = 2;
 	uint64 payment_amount_sat = 3;
 	optional bytes mailbox_id = 4;
+	// How long the server should keep trying to pay the invoice; 0 makes a
+	// single attempt. Values above the server's maximum are capped to it.
+	// The server picks its default when unset.
+	optional uint32 retry_for_secs = 5;
 }
 
 message CheckLightningPaymentRequest {
@@ -323,7 +411,9 @@ message LightningPaymentStatus {
 	oneof payment_status {
 		core.Empty pending = 1;
 		PaymentSuccessStatus success = 2;
-		core.Empty failed = 3;
+		// Was core.Empty. Both are length-delimited, so the wire format is
+		// unchanged and an older peer still matches the `failed` arm.
+		core.LightningPaymentFailure failed = 3;
 	};
 }
 
@@ -342,6 +432,12 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
+	// Seconds until the invoice expires. Defaults to the server's invoice
+	// expiry, which is also the longest it accepts.
+	optional uint64 expiry_secs = 6;
+	// The key the HTLC-recv VTXOs will be locked to. When set, the claim can
+	// only be prepared with this key and a claim_attestation signed by it.
+	optional bytes claim_pubkey = 7;
 }
 
 message StartLightningReceiveResponse {
@@ -361,6 +457,9 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
+	// Signature by user_pubkey over the payment hash and htlc_recv_expiry,
+	// required when the receive was started with a claim_pubkey.
+	optional bytes claim_attestation = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -539,6 +638,8 @@ message RoundParticipationResponse {
 
 message RoundParticipationStatusRequest {
 	bytes unlock_hash = 1;
+	// a RoundParticipationStatusAttestation signed with the participation's mailbox key
+	bytes attestation = 2;
 }
 
 enum RoundParticipationStatus {
@@ -587,6 +688,8 @@ message ForfeitNoncesRequest {
 	bytes unlock_hash = 1;
 	// the VTXO IDs of the VTXOs to be forfeited for the same unlock preimage
 	repeated bytes vtxo_ids = 2;
+	// a ForfeitNoncesAttestation for each VTXO, in the same order
+	repeated bytes attestations = 3;
 }
 
 message ForfeitNoncesResponse {
@@ -617,8 +720,20 @@ service LightningAdminService {
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }
 
+// Retained for clients of the previous admin API.
 service SweepAdminService {
 	rpc TriggerSweep(core.Empty) returns (core.Empty) {}
+}
+
+service WatchmanAdminService {
+	rpc TriggerSweep(core.Empty) returns (core.Empty) {}
+	rpc ReindexFrontier(core.Empty) returns (ReindexFrontierResponse) {}
+}
+
+service BlocklistAdminService {
+	// Re-read the bitcoin address blocklist file now and replace the list,
+	// so removals apply too. The periodic refresh only ever adds.
+	rpc ReloadBlocklist(core.Empty) returns (ReloadBlocklistResponse) {}
 }
 
 service BanAdminService {
@@ -666,6 +781,37 @@ message ListNurseryTxsResponse {
 
 message AbandonRequest {
 	string txid = 1;
+}
+
+message ReloadBlocklistResponse {
+	uint64 total = 1;
+	uint64 added = 2;
+	uint64 removed = 3;
+}
+
+message ReindexFrontierResponse {
+	// Number of frontier entries verified against the chain.
+	uint64 entries_checked = 1;
+	// Entries whose missed or incorrect confirmation height was repaired.
+	uint64 confirmations_repaired = 2;
+	// Entries whose missed on-chain spend was registered.
+	uint64 spends_repaired = 3;
+	// VTXOs newly added to the frontier as children of repaired spends.
+	uint64 vtxos_added = 4;
+	// Funding txs with unfrontiered VTXOs that were processed.
+	uint64 funding_txs_added = 5;
+	// VTXOs newly registered from unfrontiered funding txs.
+	uint64 funding_vtxos_added = 6;
+	// Entries spent on-chain whose spending tx was not found.
+	uint64 unresolved_spends = 7;
+	// Number of blocks scanned looking for missed spends.
+	uint64 blocks_scanned = 8;
+	// Entries whose stored confirmation height was cleared because their
+	// tx is no longer confirmed.
+	uint64 confirmations_cleared = 9;
+	// VTXOs whose stored on-chain spend was cleared because the spending
+	// tx is no longer confirmed.
+	uint64 spends_cleared = 10;
 }
 
 message BanVtxoRequest {

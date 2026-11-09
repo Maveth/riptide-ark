@@ -20,10 +20,18 @@ pub enum Error {
 }
 
 pub fn sign(wallet: &Wallet, psbt: &mut Psbt) -> Result<bool, Error> {
+	sign_with_signers(psbt, &[
+		wallet.get_signers(KeychainKind::External).as_ref(),
+		wallet.get_signers(KeychainKind::Internal).as_ref(),
+	])
+}
+
+/// Sign using explicitly retained keys, including after a BDK wallet reload.
+pub fn sign_with_signers(psbt: &mut Psbt, signers: &[&bdk_wallet::signer::SignersContainer]) -> Result<bool, Error> {
 	if psbt.inputs.len() != psbt.unsigned_tx.input.len() { return Err(Error::Prevout); }
 	let secp = Secp256k1::new();
-	let mut keys = wallet.get_signers(KeychainKind::External).as_key_map(&secp);
-	keys.extend(wallet.get_signers(KeychainKind::Internal).as_key_map(&secp));
+	let mut keys = bdk_wallet::miniscript::descriptor::KeyMap::new();
+	for signer in signers { keys.extend(signer.as_key_map(&secp)); }
 	let prevouts = psbt.inputs.iter().zip(&psbt.unsigned_tx.input).map(|(p, vin)| {
 		let out = p.witness_utxo.clone().ok_or(Error::Prevout)?;
 		if let Some(tx) = &p.non_witness_utxo {
@@ -106,10 +114,47 @@ pub fn sign(wallet: &Wallet, psbt: &mut Psbt) -> Result<bool, Error> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::bdk::WalletExt;
 	use bdk_wallet::chain::BlockId;
 	use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
 	use bitcoin::{Amount, BlockHash, Network};
 	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn reloaded_wallet_signs_with_explicit_keys() {
+		let master = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[44; 32]).unwrap();
+		let descriptor = format!("tr({master}/0/*)");
+		let mut original = Wallet::create_single(descriptor.clone())
+			.network(Network::Regtest).create_wallet_no_persist().unwrap();
+		insert_checkpoint(&mut original, BlockId { height: 1000, hash: BlockHash::all_zeros() });
+		receive_output_in_latest_block(&mut original, Amount::from_sat(100_000));
+		let changeset = original.take_staged().unwrap();
+		let mut reloaded = Wallet::load().check_network(Network::Regtest)
+			.load_wallet_no_persist(changeset).unwrap().unwrap();
+		let signers = reloaded.build_signers(descriptor).unwrap();
+		let address = reloaded.reveal_next_address(KeychainKind::External).address;
+		let mut builder = reloaded.build_tx();
+		builder.add_recipient(address.script_pubkey(), Amount::from_sat(50_000));
+		builder.fee_absolute(Amount::from_sat(1000));
+		let mut psbt = builder.finish().unwrap();
+		let before = psbt.clone();
+		assert!(sign_with_signers(&mut psbt, &[]).is_err());
+		assert_eq!(psbt, before);
+		assert!(sign_with_signers(&mut psbt, &[&signers]).unwrap());
+		let prevouts = psbt.inputs.iter().map(|i| i.witness_utxo.clone().unwrap()).collect::<Vec<_>>();
+		for (idx, input) in psbt.inputs.iter().enumerate() {
+			let witness = input.final_script_witness.as_ref().unwrap();
+			let sig = witness.iter().next().unwrap();
+			assert_eq!(sig.len(), 65);
+			assert_eq!(sig[64], unified::ALL);
+			let hash = unified::digest(&psbt.unsigned_tx, idx, &prevouts, unified::ALL,
+				Execution { script_type: 2, script_code: None, annex: None, leaf: None }).unwrap();
+			let key = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&prevouts[idx].script_pubkey.as_bytes()[2..]).unwrap();
+			Secp256k1::verification_only().verify_schnorr(
+				&bitcoin::secp256k1::schnorr::Signature::from_slice(&sig[..64]).unwrap(),
+				&hash.into(), &key).unwrap();
+		}
+	}
 
 	#[test]
 	fn standard_v2_anchor_signing_checks_exact_witness() {

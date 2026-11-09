@@ -17,6 +17,7 @@ use crate::rpcserver::{
 	middleware, StatusContext, ToStatusResult,
 	DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS, RPC_RICH_ERRORS,
 };
+use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::system::RuntimeManager;
 use crate::Server;
 
@@ -79,7 +80,7 @@ impl rpc::server::LightningAdminService for Server {
 		req: tonic::Request<protos::LightningNodeUri>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
-		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
+		let uri = http::Uri::from_str(req.uri.as_str()).badarg("invalid lightning node uri")?;
 		let _ = self.lightning_manager.activate(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
 	}
@@ -90,14 +91,14 @@ impl rpc::server::LightningAdminService for Server {
 		req: tonic::Request<protos::LightningNodeUri>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
 		let req = req.into_inner();
-		let uri = http::Uri::from_str(req.uri.as_str()).unwrap();
+		let uri = http::Uri::from_str(req.uri.as_str()).badarg("invalid lightning node uri")?;
 		let _ = self.lightning_manager.disable(uri);
 		Ok(tonic::Response::new(protos::Empty{}))
 	}
 }
 
 #[async_trait]
-impl rpc::server::SweepAdminService for crate::watchman::Daemon {
+impl rpc::server::WatchmanAdminService for crate::watchman::Daemon {
 	#[tracing::instrument(skip(self, _req))]
 	async fn trigger_sweep(
 		&self,
@@ -106,6 +107,72 @@ impl rpc::server::SweepAdminService for crate::watchman::Daemon {
 
 		self.watchman_handle().trigger_sweep();
 		Ok(tonic::Response::new(protos::Empty {}))
+	}
+
+	#[tracing::instrument(skip(self, _req))]
+	async fn reindex_frontier(
+		&self,
+		_req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::ReindexFrontierResponse>, tonic::Status> {
+		let stats = self.watchman_handle().reindex_frontier().await.to_status()?;
+		Ok(tonic::Response::new(protos::ReindexFrontierResponse {
+			entries_checked: stats.entries_checked as u64,
+			confirmations_repaired: stats.confirmations_repaired as u64,
+			spends_repaired: stats.spends_repaired as u64,
+			vtxos_added: stats.vtxos_added as u64,
+			funding_txs_added: stats.funding_txs_added as u64,
+			funding_vtxos_added: stats.funding_vtxos_added as u64,
+			unresolved_spends: stats.unresolved_spends as u64,
+			blocks_scanned: stats.blocks_scanned as u64,
+			confirmations_cleared: stats.confirmations_cleared as u64,
+			spends_cleared: stats.spends_cleared as u64,
+		}))
+	}
+}
+
+#[async_trait]
+impl rpc::server::SweepAdminService for crate::watchman::Daemon {
+	async fn trigger_sweep(
+		&self,
+		req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		rpc::server::WatchmanAdminService::trigger_sweep(self, req).await
+	}
+}
+
+async fn reload_blocklist(
+	list: Option<&BitcoinAddressBlocklist>,
+) -> Result<tonic::Response<protos::ReloadBlocklistResponse>, tonic::Status> {
+	let list = list.ok_or_else(|| tonic::Status::failed_precondition(
+		"no bitcoin address blocklist configured",
+	))?;
+	let r = list.reload().await.to_status()?;
+	Ok(tonic::Response::new(protos::ReloadBlocklistResponse {
+		total: r.total as u64,
+		added: r.added as u64,
+		removed: r.removed as u64,
+	}))
+}
+
+#[async_trait]
+impl rpc::server::BlocklistAdminService for Server {
+	#[tracing::instrument(skip(self, _req))]
+	async fn reload_blocklist(
+		&self,
+		_req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::ReloadBlocklistResponse>, tonic::Status> {
+		reload_blocklist(self.bitcoin_address_blocklist.as_ref()).await
+	}
+}
+
+#[async_trait]
+impl rpc::server::BlocklistAdminService for crate::watchman::Daemon {
+	#[tracing::instrument(skip(self, _req))]
+	async fn reload_blocklist(
+		&self,
+		_req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::ReloadBlocklistResponse>, tonic::Status> {
+		reload_blocklist(self.bitcoin_address_blocklist()).await
 	}
 }
 
@@ -210,7 +277,8 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 		.add_service(rpc::server::RoundAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::LightningAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::BanAdminServiceServer::from_arc(srv.clone()))
-		.add_service(rpc::server::NurseryAdminServiceServer::from_arc(srv.clone()));
+		.add_service(rpc::server::NurseryAdminServiceServer::from_arc(srv.clone()))
+		.add_service(rpc::server::BlocklistAdminServiceServer::from_arc(srv.clone()));
 
 	tonic::transport::Server::builder()
 		.http2_max_pending_accept_reset_streams(Some(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS))
@@ -234,7 +302,9 @@ pub async fn run_watchmand_admin_rpc_server(
 
 	let routes = tonic::service::Routes::default()
 		.add_service(rpc::server::SweepAdminServiceServer::from_arc(daemon.clone()))
-		.add_service(rpc::server::WalletAdminServiceServer::from_arc(daemon));
+		.add_service(rpc::server::WatchmanAdminServiceServer::from_arc(daemon.clone()))
+		.add_service(rpc::server::WalletAdminServiceServer::from_arc(daemon.clone()))
+		.add_service(rpc::server::BlocklistAdminServiceServer::from_arc(daemon));
 
 	tonic::transport::Server::builder()
 		.http2_max_pending_accept_reset_streams(Some(DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS))

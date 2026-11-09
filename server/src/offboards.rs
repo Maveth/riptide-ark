@@ -12,7 +12,8 @@ use ark::{musig, VtxoId};
 use ark::attestations::OffboardRequestAttestation;
 use ark::fees::{validate_and_subtract_fee_min_dust, VtxoFeeInfo};
 use ark::offboard::{OffboardForfeitContext, OffboardRequest};
-use bitcoin_ext::bdk::WithGuaranteedChange;
+use bitcoin_ext::P2TR_DUST;
+use bitcoin_ext::bdk::{WalletExt, WithGuaranteedChange};
 
 use crate::{check_max_amount, Server, SECP};
 use crate::bitcoind as bcd;
@@ -150,6 +151,23 @@ impl Server {
 
 		request.validate().badarg("invalid offboard request")?;
 
+		// Check no duplicates in inputs
+		if input_vtxos.iter().collect::<HashSet<_>>().len() != input_vtxos.len() {
+			return badarg!("duplicate input vtxo");
+		}
+
+		if attestations.len() != input_vtxos.len() {
+			return badarg!("wrong number of attestations");
+		}
+
+		// Only the owner of the inputs may lock them, so the attestations are
+		// checked before the flux lock below.
+		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxos).await).await?;
+		for (input, attestation) in vtxos.iter().zip(&attestations) {
+			attestation.verify(&request, &input_vtxos, &input.vtxo)
+				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
+		}
+
 		// We keep the VTXO flux lock for the duration of the session, this means
 		// that if the user bails a session he has to wait for it to time out
 		// (currently set to 30 secs)
@@ -164,25 +182,15 @@ impl Server {
 				// The client may be re-sending a request whose response it
 				// never received. If we still hold the pending session for
 				// exactly this request, replay the same response.
-				let replayed = self.replay_pending_offboard(
-					&request, &input_vtxos, &attestations,
-				).await?;
-				if let Some(resp) = replayed {
+				if let Some(resp) = self.replay_pending_offboard(&request, &input_vtxos) {
 					return Ok(resp);
 				}
 				return Err(e).context("some VTXO is already locked by another process");
 			},
 		};
 
-		// Check no duplicates in inputs
-		if input_vtxos.iter().collect::<HashSet<_>>().len() != input_vtxos.len() {
-			return badarg!("duplicate input vtxo");
-		}
-
-		if attestations.len() != input_vtxos.len() {
-			return badarg!("wrong number of attestations");
-		}
-
+		// An arkoor can spend an input between the read above and the lock,
+		// so the spend state is read again under the lock.
 		// `check_spendable` also refuses inputs that exited onchain.
 		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxos).await).await?;
 		let tip = self.chain_tip().height;
@@ -258,13 +266,6 @@ impl Server {
 		let net_amount = request.net_amount;
 		let fee = gross_amount.checked_sub(net_amount).context("offboard fee underflow")?;
 
-		// check attestations
-		let input_ids = input_vtxos.iter().copied().collect::<Vec<VtxoId>>();
-		for (input, attestation) in vtxos.iter().zip(&attestations) {
-			attestation.verify(&request, &input_ids, &input.vtxo)
-				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
-		}
-
 		// Even if we need multiple connectors, we just need a single output now,
 		// the multi-connector fan-out tx can be constructed at-forfeit-claim-time.
 		//
@@ -278,8 +279,9 @@ impl Server {
 
 		let script_pubkey = request.script_pubkey.clone();
 		let fee_rate = request.fee_rate;
-		// The `_` releases the wallet lock here: nothing below needs it.
-		let (_, (offboard_tx, wallet_input_guard)) = self.rounds_wallet.build_blocking(
+		// Keep the wallet lock until the session holds its inputs, so the
+		// locked value below also counts concurrent prepares.
+		let (mut wallet, (offboard_tx, wallet_input_guard)) = self.rounds_wallet.build_blocking(
 			move |wallet| {
 				let selection = WithGuaranteedChange(SingleRandomDraw);
 				let psbt = wallet.build_tx_at_chunk_feerate(selection, fee_rate, |b| {
@@ -297,6 +299,23 @@ impl Server {
 				Ok((psbt, inputs))
 			},
 		).await.context("failed to build offboard tx")?;
+
+		// Abandoned sessions lock their inputs until they expire, so cap what
+		// they lock together to keep funds for rounds and other users. One
+		// session may always lock what it needs, however few coins we have.
+		let value = |utxos: &[OutPoint]| utxos.iter()
+			.filter_map(|utxo| wallet.get_utxo(*utxo))
+			.map(|utxo| utxo.txout.value)
+			.sum::<Amount>();
+		let locked_by_others = value(&self.pending_offboard_utxos());
+		let max_locked = wallet.balance().trusted
+			* u64::from(self.config.offboard_max_locked_percent) / 100;
+		if locked_by_others > Amount::ZERO
+			&& locked_by_others + value(wallet_input_guard.utxos()) > max_locked
+		{
+			wallet.mark_output_keys_unused(&offboard_tx.unsigned_tx);
+			return unavailable!("too many pending offboards, try again later");
+		}
 
 		let (forfeit_sec_nonces, forfeit_pub_nonces) = (0..input_vtxos.len()).map(|_| {
 			musig::nonce_pair(self.server_key.leak_ref())
@@ -335,6 +354,7 @@ impl Server {
 		assert!(matches!(old, None | Some(OffboardSession::Failed)),
 			"txid collision with a live offboard session",
 		);
+		drop(wallet);
 
 		Ok(ret)
 	}
@@ -348,12 +368,14 @@ impl Server {
 	/// is safe: the secret nonces are used to sign at most once, because
 	/// [Server::finish_offboard] takes the session out of the map before
 	/// signing with them.
-	async fn replay_pending_offboard(
+	///
+	/// The caller must have verified the attestations, so that only the
+	/// owner of the inputs learns the session's txid and nonces.
+	fn replay_pending_offboard(
 		&self,
 		request: &OffboardRequest,
 		input_vtxos: &[VtxoId],
-		attestations: &[OffboardRequestAttestation],
-	) -> anyhow::Result<Option<OffboardResponse>> {
+	) -> Option<OffboardResponse> {
 		let existing = {
 			let guard = self.pending_offboards.lock();
 			guard.values().filter_map(|s| s.as_pending())
@@ -364,24 +386,13 @@ impl Server {
 				})
 		};
 		let Some(resp) = existing else {
-			return Ok(None);
+			return None;
 		};
-
-		// Verify the attestations so that only the owner of the input
-		// vtxos can learn the session's txid and nonces.
-		if attestations.len() != input_vtxos.len() {
-			return badarg!("wrong number of attestations");
-		}
-		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(input_vtxos).await).await?;
-		for (input, attestation) in vtxos.iter().zip(attestations) {
-			attestation.verify(request, input_vtxos, &input.vtxo)
-				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
-		}
 
 		slog!(ReplayedOffboardSession, offboard_txid: resp.offboard_tx.compute_txid(),
 			input_vtxos: input_vtxos.to_vec(),
 		);
-		Ok(Some(resp))
+		Some(resp)
 	}
 
 	/// Commit the offboard with the wallet, broadcast it and mark committed

@@ -11,6 +11,7 @@ mod embedded {
 mod ban;
 pub mod block;
 pub mod data_migrations;
+pub mod hold;
 pub mod htlc_vtxo;
 pub mod watchman;
 pub mod intman;
@@ -20,6 +21,7 @@ pub mod nursery;
 pub mod rounds;
 pub mod tree;
 pub mod vtxopool;
+pub mod xpay;
 
 mod model;
 mod query;
@@ -43,7 +45,7 @@ use ark::vtxo::{Bare, Full};
 use bb8::{ManageConnection, Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use bdk_wallet::{chain::Merge, ChangeSet};
-use bitcoin::{Amount, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, Script, Transaction, Txid};
 use bitcoin::consensus::{serialize, deserialize};
 use bitcoin::secp256k1::{self, PublicKey};
 use chrono::Local;
@@ -51,7 +53,7 @@ use futures::Stream;
 use tokio_postgres::{Client, NoTls, RowStream};
 use tokio_postgres::types::Type;
 use tracing::{info, warn};
-use ark::{ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
+use ark::{ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::mailbox::{MailboxIdentifier, MailboxType};
 use ark::encode::ProtocolEncoding;
@@ -59,6 +61,8 @@ use ark::encode::ProtocolEncoding;
 use crate::error::ContextExt;
 use crate::wallet::WalletKind;
 use crate::config::Postgres as PostgresConfig;
+use crate::ln::LightningFailureKind;
+use crate::secret::Secret;
 use crate::telemetry;
 
 /// Can be used as function argument when there are no query_raw arguments
@@ -136,7 +140,9 @@ pub enum MailboxPayload {
 	LightningSendFinished {
 		payment_hash: PaymentHash,
 		/// The preimage, present only on success.
-		preimage: Option<Preimage>,
+		preimage: Option<Secret<Preimage>>,
+		/// Why it failed. `None` on success and on pre-V69 rows.
+		failure: Option<LightningFailureKind>,
 	},
 }
 
@@ -402,6 +408,34 @@ impl<'t> Tx<'t> {
 		query::get_vtxos_by_id(&self, ids).await
 	}
 
+	/// Like [Self::get_server_vtxos_by_id], but unknown ids are left out
+	/// instead of failing the lookup.
+	pub async fn get_existing_server_vtxos_by_id(
+		&self,
+		ids: &[VtxoId],
+	) -> anyhow::Result<HashMap<VtxoId, VtxoState<Full, ServerVtxoPolicy>>> {
+		query::get_existing_vtxos_by_id(&self, ids).await
+	}
+
+	/// A page of at most `limit` VTXOs owned by `policy` ordered by id,
+	/// starting after the VTXO `after` when given, whatever their spend state.
+	pub async fn get_vtxos_by_policy_page(
+		&self,
+		policy: &VtxoPolicy,
+		after: Option<VtxoId>,
+		limit: usize,
+	) -> anyhow::Result<Vec<VtxoState<Full, ServerVtxoPolicy>>> {
+		query::get_vtxos_by_policy_page(&self, policy, after, limit).await
+	}
+
+	/// The given policies that own at least one VTXO, whatever its spend state.
+	pub async fn get_used_vtxo_policies(
+		&self,
+		policies: &[VtxoPolicy],
+	) -> anyhow::Result<Vec<VtxoPolicy>> {
+		query::get_used_vtxo_policies(&self, policies).await
+	}
+
 	pub async fn get_user_vtxo_by_id(&self, id: VtxoId) -> anyhow::Result<VtxoState> {
 		let v = self.get_server_vtxo_by_id(id).await?;
 		match v.try_into_user_vtxo_state() {
@@ -521,6 +555,7 @@ impl<'t> Tx<'t> {
 			)
 			SELECT
 				m.vtxo_id, m.vtxo, m.payment_hash, m.unlock_hash, m.preimage,
+				m.failure_reason,
 				m.checkpoint, m.mailbox_type::TEXT AS entry_type, m.amount_sat
 			FROM mailbox m
 			WHERE m.unblinded_mailbox_id = $1
@@ -601,12 +636,16 @@ impl<'t> Tx<'t> {
 					let payment_hash = PaymentHash::from_str(&hash_str)
 						.context("invalid payment hash in mailbox notification")?;
 					let preimage = row.get::<_, Option<String>>("preimage");
-					let preimage = preimage.map(|s| Preimage::from_str(&s))
+					let preimage = preimage.map(|s| Preimage::from_str(&s).map(Secret::new))
 						.transpose()
 						.context("invalid preimage in mailbox notification")?;
+					let failure = row.get::<_, Option<String>>("failure_reason")
+						.map(|s| LightningFailureKind::from_str(&s));
 					res.push(MailboxEntry {
 						checkpoint: cp,
-						payload: MailboxPayload::LightningSendFinished { payment_hash, preimage },
+						payload: MailboxPayload::LightningSendFinished {
+							payment_hash, preimage, failure,
+						},
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 					continue;
@@ -750,6 +789,7 @@ impl<'t> Tx<'t> {
 		mailbox_id: MailboxIdentifier,
 		payment_hash: PaymentHash,
 		preimage: Option<Preimage>,
+		failure: Option<LightningFailureKind>,
 	) -> anyhow::Result<Option<Checkpoint>> {
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
@@ -762,16 +802,18 @@ impl<'t> Tx<'t> {
 		let mailbox_type_str = String::from(MailboxType::LnSendFinished);
 		let payment_hash_str = payment_hash.to_string();
 		let preimage_str = preimage.map(|p| p.to_string());
+		let failure_str = failure.map(|f| f.as_str());
 
 		let statement = self.prepare("
-			INSERT INTO mailbox (unblinded_mailbox_id, payment_hash, preimage, checkpoint, mailbox_type, created_at)
-			VALUES ($1, $2, $3, $4, $5::TEXT::mailbox_type, NOW())
+			INSERT INTO mailbox (unblinded_mailbox_id, payment_hash, preimage, failure_reason, checkpoint, mailbox_type, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6::TEXT::mailbox_type, NOW())
 			ON CONFLICT (mailbox_type, payment_hash) DO NOTHING;
 		").await?;
 		let rows_inserted = self.execute(&statement, &[
 			&mailbox_id.to_string(),
 			&payment_hash_str,
 			&preimage_str,
+			&failure_str,
 			&checkpoint,
 			&mailbox_type_str,
 		]).await?;
@@ -939,6 +981,32 @@ impl<'t> Tx<'t> {
 		self.add_funding_vtxos_to_frontier(offboard_txid, None).await?;
 
 		Ok(())
+	}
+
+	/// Bind a board funding output to `exit_txid`, unless it is bound
+	/// already. Returns the exit txid the output is bound to.
+	pub async fn bind_board_exit(
+		&self,
+		funding_outpoint: OutPoint,
+		funding_spk: &Script,
+		exit_txid: Txid,
+	) -> anyhow::Result<Txid> {
+		let insert = self.prepare_typed(
+			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
+			&[Type::TEXT, Type::BYTEA, Type::TEXT],
+		).await?;
+		let outpoint = funding_outpoint.to_string();
+		let spk = funding_spk.as_bytes();
+		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string()]).await?;
+
+		// a separate statement, so it sees a row a concurrent insert committed
+		let select = self.prepare_typed(
+			"SELECT exit_txid FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
+			&[Type::TEXT, Type::BYTEA],
+		).await?;
+		let row = self.query_one(&select, &[&outpoint, &spk]).await?;
+		Ok(Txid::from_str(row.get("exit_txid"))?)
 	}
 
 	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.

@@ -17,7 +17,7 @@
 //! snapshot of `NodeHandle`s for the currently-online nodes into a shared
 //! `parking_lot::RwLock` whenever node state changes.
 //!
-//! Data-path operations (pay, generate/settle/cancel invoice, fetch bolt12)
+//! Data-path operations (pay, generate/settle invoice, fetch bolt12)
 //! run directly on the caller's task: they pick a node via one of the
 //! manager's getters (`active_node`, `hold_active_node`, `node_by_id`) and
 //! issue RPCs on the cloned handle. A small `Ctrl` mpsc channel survives only
@@ -25,7 +25,7 @@
 //!
 //! ## Routing
 //!
-//! `generate_invoice`/`settle_invoice`/`cancel_invoice` route to the backend's
+//! `generate_invoice`/`settle_invoice` route to the backend's
 //! receive monitor (e.g. `ClnHold` for CLN). `pay` routes to the backend's pay
 //! monitor (e.g. `ClnXpay`). `fetch_bolt12` calls the backend's gRPC directly.
 //! Intra-Ark payments short-circuit both paths: the manager updates the DB and
@@ -39,7 +39,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
+use chrono::{DateTime, Local, TimeDelta};
 use cln_rpc::plugins::hold as hold_plugin;
 use lightning_invoice::Bolt11Invoice;
 use futures::Stream;
@@ -50,18 +52,22 @@ use tracing::{debug, error, info, trace, warn};
 use ark::VtxoId;
 use ark::lightning::{Bolt12Invoice, Bolt12InvoiceExt, Invoice, Offer, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
+use uuid::Uuid;
 
 use crate::Server;
 use crate::error::ContextExt;
 use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle};
 use crate::ln::cln::hold::ClnHoldConfig;
 use crate::ln::cln::xpay::ClnXpayConfig;
+use crate::ln::guard::PaymentGuards;
 use crate::ln::settler::HtlcSettler;
 use crate::ln::validate_intra_ark_payment;
 use crate::sync::SyncManager;
 use crate::system::RuntimeManager;
 use crate::config::Config;
 use crate::database;
+use crate::database::hold::{self as hold_db, HoldTransition, NewClnHold};
+use crate::database::xpay::{self, NewClnXpay};
 use crate::database::ln::{
 	LightningNodeId, LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus,
 };
@@ -88,9 +94,7 @@ pub struct LightningManager {
 	db: database::Db,
 	settler: Arc<HtlcSettler>,
 	invoice_poll_interval: Duration,
-	invoice_expiry: Duration,
 	htlc_expiry_delta: BlockDelta,
-	cln_xpay_timeout: Duration,
 	mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
 
 	/// This channel is to manage individual CLN integrations.
@@ -102,7 +106,7 @@ pub struct LightningManager {
 	node_handles: Arc<parking_lot::RwLock<Vec<NodeHandle>>>,
 
 	/// We also keep a handle of the update channel to update from
-	/// payment request that fail before the hit the sendpay stream.
+	/// payment request that fail before they reach CLN.
 	//TODO(stevenroose) consider changing this to hold some update info
 	payment_update_tx: broadcast::Sender<PaymentHash>,
 	// If all receivers are dropped the channel will close and the payment might fail
@@ -123,6 +127,7 @@ impl LightningManager {
 		sync_manager: Arc<SyncManager>,
 		mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
 		settler: Arc<HtlcSettler>,
+		payment_guards: PaymentGuards,
 	) -> anyhow::Result<LightningManager> {
 		let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
 		let (payment_update_tx, payment_update_rx) = broadcast::channel(256);
@@ -141,7 +146,6 @@ impl LightningManager {
 		};
 		let xpay_config = ClnXpayConfig {
 			invoice_check_interval: config.invoice_check_interval,
-			cln_xpay_timeout: config.cln_xpay_timeout,
 			check_base_delay: config.invoice_check_base_delay,
 			max_check_delay: config.max_invoice_check_delay,
 		};
@@ -157,6 +161,7 @@ impl LightningManager {
 			sync_manager,
 			mailbox_manager: mailbox_manager.clone(),
 			settler: settler.clone(),
+			payment_guards,
 
 			payment_update_tx: payment_update_tx.clone(),
 
@@ -181,9 +186,7 @@ impl LightningManager {
 			payment_update_tx,
 			payment_update_rx,
 			invoice_poll_interval: config.invoice_poll_interval,
-			invoice_expiry: config.invoice_expiry,
 			htlc_expiry_delta: config.htlc_expiry_delta,
-			cln_xpay_timeout: config.cln_xpay_timeout,
 		})
 	}
 
@@ -284,6 +287,7 @@ impl LightningManager {
 		htlc_vtxo_ids: Vec<VtxoId>,
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
+		retry_for: Duration,
 	) -> anyhow::Result<()> {
 		invoice.require_xbt()?;
 		invoice.check_signature().context("invalid invoice signature")?;
@@ -299,6 +303,7 @@ impl LightningManager {
 			&htlc_vtxo_ids,
 			user_fee,
 			attempt_block_height,
+			retry_for,
 		).await {
 			// The attempt is already recorded as failed and the client sees the
 			// failure via CheckLightningPayment. Benign races (someone else paid
@@ -320,8 +325,7 @@ impl LightningManager {
 	///
 	/// If a hold-invoice subscription already exists for this payment hash,
 	/// this is an intra-Ark payment and we settle off-CLN instead of issuing
-	/// an outbound xpay. Otherwise we spawn the xpay fire-and-forget; the
-	/// xpay monitor picks the result up via the sendpays stream.
+	/// an outbound xpay. Otherwise we spawn the xpay fire-and-forget.
 	#[tracing::instrument(skip_all, fields(
 		payment_hash = %invoice.payment_hash(),
 		invoice = %invoice,
@@ -339,6 +343,7 @@ impl LightningManager {
 		htlc_vtxo_ids: &[VtxoId],
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
+		retry_for: Duration,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let node = self.active_node().context("no active cln node")?;
@@ -363,13 +368,59 @@ impl LightningManager {
 		// label: the column has no cardinality budget.
 		let user_agent = telemetry::current_user_agent();
 
-		self.db.write(async |t|
-			t.store_lightning_payment_start(
+		// An outgoing payment is an xpay call, and the call is recorded in
+		// cln_xpay next to the attempt. An intra-Ark payment never calls xpay
+		// and gets no row. The deadlines are computed here, before anything is
+		// stored, so a payment we cannot make leaves nothing behind.
+		let new_xpay = if sub.is_none() {
+			// NB: we don't want a lightning payment to take more time than the
+			// htlc-send expiry leaves us with.
+			let max_cltv_expiry_delta = htlc_send_expiry_height
+				.checked_blocks_since(BlockHeight::new(tip) + self.htlc_expiry_delta)
+				.context("HTLC expiry height is too soon to perform a lightning payment")?;
+			let max_cltv_expiry_delta = BlockDelta::try_from(max_cltv_expiry_delta)
+				.unwrap_or(BlockDelta::MAX);
+
+			// The absolute form of the relative deadlines the xpay call takes.
+			let attempt_expiry = Local::now() + TimeDelta::from_std(retry_for)
+				.context("retry_for does not fit in a timestamp")?;
+			let htlc_expiry = BlockHeight::new(tip) + max_cltv_expiry_delta;
+
+			// A unique label ties this call to CLN's own record of it.
+			let label = Uuid::new_v4().to_string();
+			Some((max_cltv_expiry_delta, NewClnXpay {
+				lightning_node_id: node.id,
+				payment_amount_msat: amount.to_msat(),
+				max_routing_fee_msat: Some(max_routing_fee.to_msat()),
+				attempt_expiry,
+				partial_msat: None,
+				htlc_expiry: Some(htlc_expiry),
+				label: Some(label),
+				payment_hash,
+				user_fee_msat: Some(user_fee.to_msat()),
+				user_agent: user_agent.as_deref().map(str::to_string),
+			}))
+		} else {
+			None
+		};
+
+		let attempt_id = self.db.write(async |t| {
+			let attempt_id = t.store_lightning_payment_start(
 				node.id, &invoice, amount, sender_mailbox_id, htlc_vtxo_ids,
 				lightning_htlc_subscription_id,
-				attempt_block_height, user_fee, user_agent.as_deref(),
-			).await
-		).await?;
+				attempt_block_height, user_fee, user_agent.as_deref(), retry_for,
+				// An intra-Ark payment short-circuits before xpay, so no
+				// routing budget is ever authorised for it.
+				lightning_htlc_subscription_id.is_none().then_some(max_routing_fee),
+			).await?;
+			// Same transaction as the attempt: the attempt check above is what
+			// keeps one payment per hash in flight, and the cln_xpay row must
+			// not outlive an attempt that was never stored.
+			if let Some((_, new)) = &new_xpay {
+				xpay::create_xpay(&**t, new).await.context("failed to store the xpay call")?;
+			}
+			Ok(attempt_id)
+		}).await?;
 
 		// If there is an existing subscription, it's an intra-Ark lightning
 		// payment so we can directly mark it as accepted, then skip cln payment.
@@ -381,45 +432,54 @@ impl LightningManager {
 			// it: `initiate_lightning_payment` checks the same thing, but a
 			// receive registered after that check would otherwise land here
 			// unvalidated and be paid out of our vtxopool.
+			// `refused` is whether the receive was left unpromoted. Any other
+			// error may have promoted it and must keep the link: revoking then
+			// has to see the receive and refuse while HTLC-recvs are granted.
 			let res = match validate_intra_ark_payment(&sub, &invoice, amount) {
-				Ok(()) => self.set_created_subscription_to_accepted(sub, htlc_send_expiry_height).await,
-				Err(e) => Err(e),
+				Ok(()) => self.set_created_subscription_to_accepted(sub, htlc_send_expiry_height).await
+					.map_err(|e| {
+						let refused = e.downcast_ref::<PayInvoiceRace>().is_some();
+						(e, refused)
+					}),
+				Err(e) => Err((e, true)),
 			};
-			if let Err(e) = res {
+			if let Err((e, refused)) = res {
 				trace!("Failed to update subscription status: {e:#}");
 				let payment_attempt = self.db
 					.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await?
 					.expect("we inserted a payment attempt");
 
-				self.payment_handler().fail_payment_attempt(&payment_attempt, Some(&e.to_string())).await?;
+				// A refused payment never funded the receive, so revoking it must
+				// not cancel the receive.
+				let payment_handler = self.payment_handler();
+				if refused {
+					payment_handler.fail_refused_payment_attempt(&payment_attempt, Some(&e.to_string())).await?;
+				} else {
+					payment_handler.fail_payment_attempt(&payment_attempt, Some(&e.to_string())).await?;
+				}
 				return Err(e);
 			}
 
 			return Ok(());
 		}
 
-		// NB: we don't want a lightning payment to take more time than the
-		// htlc-send expiry leaves us with.
-		let max_cltv_expiry_delta = htlc_send_expiry_height
-			.checked_blocks_since(BlockHeight::new(tip) + self.htlc_expiry_delta)
-			.context("HTLC expiry height is too soon to perform a lightning payment")?;
-		let max_cltv_expiry_delta = BlockDelta::try_from(max_cltv_expiry_delta)
-			.unwrap_or(BlockDelta::MAX);
+		let (max_cltv_expiry_delta, new_xpay) = new_xpay
+			.expect("an outgoing payment has its xpay call prepared above");
 
 		// Fire-and-forget: ClnXpayClient::pay issues the gRPC and reconciles
-		// the DB on completion, same as the old ClnXpay::pay wrapper. If the
-		// gRPC times out the payment may still succeed; the xpay monitor's
-		// sendpay stream is the source of truth.
+		// the DB on completion. If the gRPC breaks the payment may still
+		// succeed, and the xpay monitor reconciles it.
 		trace!("Bolt11 invoice payment of {:?} sent to CLN: {}", amount, invoice);
 		let xpay_client = node.xpay.clone();
-		let retry_for = self.cln_xpay_timeout;
 		tokio::spawn(async move {
 			xpay_client.pay(
+				attempt_id,
 				invoice,
 				amount,
 				max_routing_fee,
 				max_cltv_expiry_delta,
 				retry_for,
+				new_xpay.label,
 			).await;
 		});
 		slog!(LightningPaymentInitiated, payment_hash, amount, fee: user_fee,
@@ -484,12 +544,44 @@ impl LightningManager {
 		// payment settles off-CLN, so we don't want the HTLCs locked.
 		// NB: we only issue the RPC here, not the full cancel_invoice
 		// flow - we just set the subscription to Accepted, not Canceled.
-		let mut hold_client = self.node_by_id(subscription.lightning_node_id)
-			.context("invoice cannot be canceled: node is now offline")?
-			.hold_rpc.context("node doesn't support hold anymore")?;
-		hold_client.cancel(hold_plugin::CancelRequest {
-			payment_hash: payment_hash.to_vec(),
-		}).await?;
+		// The payment is committed to the receive from here on, so a failed
+		// cancel must not fail it: the receive would no longer be claimable
+		// as a self-payment, and the sender couldn't revoke while HTLC-recvs
+		// are granted.
+		let cancel = async {
+			let mut hold_client = self.node_by_id(subscription.lightning_node_id)
+				.context("node is now offline")?
+				.hold_rpc.context("node doesn't support hold anymore")?;
+			hold_client.cancel(hold_plugin::CancelRequest {
+				payment_hash: payment_hash.to_vec(),
+			}).await?;
+			anyhow::Ok(())
+		};
+		if let Err(e) = cancel.await {
+			warn!("Could not cancel the hold invoice of intra-Ark payment {payment_hash}: {e:#}");
+		}
+
+		// The plugin no longer serves the invoice; the sender's htlc-send
+		// vtxos are what covers this receive from here on.
+		//
+		// This cannot share a transaction with the promotion, as the cancel
+		// RPC sits between them. The payment has gone ahead by now, so a
+		// failure to record the cancel must not fail it.
+		let node_id = subscription.lightning_node_id;
+		let mirrored = self.db.write(async |t| hold_db::transition_open_hold(
+			&**t, node_id, payment_hash, HoldTransition::Cancelled,
+		).await).await;
+		match mirrored {
+			Ok(Some(_)) => {},
+			Ok(None) => {
+				debug!("No open cln_hold row to cancel for intra-Ark payment {}", payment_hash);
+			},
+			Err(e) => {
+				error!("Failed to record the cancelled hold invoice of intra-Ark payment {} \
+					(subscription {}): {:#}", payment_hash, subscription.id, e,
+				);
+			},
+		}
 
 		Ok(())
 	}
@@ -570,8 +662,10 @@ impl LightningManager {
 		payment_hash: PaymentHash,
 		amount: Amount,
 		cltv_delta: BlockDelta,
+		expiry: Duration,
 		description: Option<String>,
 		receiver_mailbox_id: Option<MailboxIdentifier>,
+		claim_pubkey: Option<PublicKey>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
 		let mut hold_client = node.hold_rpc.clone().expect("hold-active node has hold_rpc");
@@ -580,7 +674,7 @@ impl LightningManager {
 			payment_hash: payment_hash.to_vec(),
 			amount_msat: amount.to_msat(),
 			min_final_cltv_expiry: Some(cltv_delta.into()),
-			expiry: Some(self.invoice_expiry.as_secs()),
+			expiry: Some(expiry.as_secs()),
 			routing_hints: vec![],
 			description: description.map(hold_plugin::invoice_request::Description::Memo),
 		}).await?.into_inner();
@@ -588,15 +682,43 @@ impl LightningManager {
 		let invoice = Bolt11Invoice::from_str(&res.bolt11)?;
 		Invoice::Bolt11(invoice.clone()).require_xbt()?;
 
-		// Raw agent, not the bucketed label -- see start_lightning_payment.
+		// Raw agent, not the bucketed label -- see start_payment.
 		let user_agent = telemetry::current_user_agent();
 
-		self.db.write(async |t|
+		// The plugin's record of the invoice, next to our subscription. The
+		// invoice carries its own expiry; the one we asked for is the fallback.
+		let expires_at = invoice.expires_at()
+			.and_then(|d| i64::try_from(d.as_secs()).ok())
+			.and_then(|secs| DateTime::from_timestamp(secs, 0))
+			.map(|dt| dt.with_timezone(&Local))
+			.unwrap_or_else(|| Local::now() + expiry);
+		let new_hold = NewClnHold {
+			lightning_node_id: node.id,
+			invoice: invoice.to_string(),
+			payment_hash,
+			requested_amount_msat: amount.to_msat(),
+			min_final_cltv_delta: cltv_delta,
+			expires_at,
+		};
+
+		let stored = self.db.write(async |t| {
 			t.store_generated_lightning_receive(
 				node.id, &Invoice::Bolt11(invoice.clone()), amount.to_msat(), receiver_mailbox_id.as_ref(),
-				user_agent.as_deref(),
-			).await
-		).await?;
+				claim_pubkey, user_agent.as_deref(),
+			).await?;
+			hold_db::create_hold(&**t, &new_hold).await
+				.context("failed to store the hold invoice")?;
+			Ok(())
+		}).await;
+		if let Err(e) = stored {
+			// Without a subscription nothing would release HTLCs held on it.
+			if let Err(cancel_err) = hold_client.cancel(hold_plugin::CancelRequest {
+				payment_hash: payment_hash.to_vec(),
+			}).await {
+				warn!("Failed to cancel unstored hold invoice {payment_hash}: {cancel_err:#}");
+			}
+			return Err(e);
+		}
 
 		Ok(invoice)
 	}
@@ -644,9 +766,9 @@ impl LightningManager {
 			if let Err(err) = hold_client.settle(hold_plugin::SettleRequest {
 				payment_preimage: preimage.to_vec(),
 			}).await {
-				// The cooperative claim and the hold settler both settle on
-				// the same preimage, so one of them can find the HTLCs
-				// already gone. That is the outcome we wanted, not a failure.
+				// An earlier call can have settled the invoice and then
+				// failed to store it, so a retry finds the HTLCs already
+				// gone. That is the outcome we wanted, not a failure.
 				let paid = is_hold_invoice_paid(&mut hold_client, payment_hash).await
 					.with_context(|| format!(
 						"hold settle failed ({}) and the invoice state is unknown", err,
@@ -661,12 +783,29 @@ impl LightningManager {
 		// Update the subscription status to settled and notify waiters.
 		// This covers both intra-ark (no CLN hook fires) and regular
 		// hold-invoice paths.
-		let newly_settled = self.db.write(async |t| t.store_lightning_htlc_subscription_status(
-			subscription_id,
-			LightningHtlcSubscriptionStatus::Settled,
-			None,
-			None,
-		).await).await?;
+		let node_id = htlc_subscription.lightning_node_id;
+		let invoice_amount_msat = htlc_subscription.amount().to_msat();
+		let newly_settled = self.db.write(async |t| {
+			let newly_settled = t.store_lightning_htlc_subscription_status(
+				subscription_id,
+				LightningHtlcSubscriptionStatus::Settled,
+				None,
+				None,
+			).await?;
+			// The hold invoice was paid along with it. An intra-Ark payment
+			// has no open hold invoice: it was canceled when the receive was
+			// accepted, so there is nothing to move.
+			if newly_settled && !is_self_payment {
+				let mirrored = hold_db::transition_open_hold(
+					&**t, node_id, payment_hash,
+					HoldTransition::Settled { invoice_amount_msat },
+				).await?;
+				if mirrored.is_none() {
+					debug!("No open cln_hold row to settle for payment hash {}", payment_hash);
+				}
+			}
+			Ok(newly_settled)
+		}).await?;
 		let _ = self.payment_update_tx.send(payment_hash);
 
 		// Only meter on the caller that actually flipped the row; retries
@@ -679,6 +818,8 @@ impl LightningManager {
 				telemetry::LightningDirection::Receive,
 				is_self_payment,
 				htlc_subscription.user_agent.as_deref(),
+				None,
+				None,
 			);
 		}
 
@@ -725,6 +866,7 @@ impl LightningManager {
 				telemetry::LightningDirection::Receive,
 				is_self_payment,
 				subscription.user_agent.as_deref(),
+				None, None,
 			);
 		}
 
@@ -777,8 +919,8 @@ impl LightningManager {
 	///   on-chain preimage extraction via the frontier). The settler is the
 	///   single source of truth for preimages; this subscriber is the
 	///   fallback path that settles hold invoices the cooperative claim
-	///   never got to. Both can end up settling the same invoice, so
-	///   [`LightningManager::settle_invoice`] tolerates losing that race.
+	///   never got to. It takes the payment hash guard, so it never settles
+	///   an invoice while a cooperative claim settles it.
 	///
 	/// - Retry on failure: a settlement that fails is retried on the same
 	///   item every 5 seconds until it succeeds, so one stuck preimage does
@@ -850,6 +992,10 @@ async fn try_settle_hold_invoice(
 	payment_hash: PaymentHash,
 	preimage: Preimage,
 ) -> bool {
+	// A cooperative claim holds this guard while it settles the same invoice,
+	// so we wait for it and then find the subscription settled.
+	let _guard = srv.payment_guards.lock(payment_hash).await;
+
 	let sub = match srv.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await {
 		Ok(Some(sub)) => sub,
 		Ok(None) => return true, // no subscription, nothing to settle
@@ -860,10 +1006,11 @@ async fn try_settle_hold_invoice(
 	};
 
 	if !matches!(sub.status, LightningHtlcSubscriptionStatus::HtlcsReady) {
-		// Safe to skip: a preimage in the WAL implies HTLCs were already
-		// locked (HtlcsReady was reached before the preimage was learned),
-		// so the only other states here are Settled or the cooperative
-		// path already handled it.
+		// Safe to skip: no HTLC-recv vtxos were granted, so the server has
+		// nothing to recover. A subscription that is only Accepted can never
+		// reach HtlcsReady now, because the grant refuses a settled hash. It
+		// stays Accepted until the forward timeout cancels it and the inbound
+		// HTLC fails back to the payer.
 		return true;
 	}
 
@@ -1016,6 +1163,7 @@ struct LightningManagerProcess {
 	sync_manager: Arc<SyncManager>,
 	mailbox_manager: Arc<crate::mailbox_manager::MailboxManager>,
 	settler: Arc<HtlcSettler>,
+	payment_guards: PaymentGuards,
 }
 
 impl LightningManagerProcess {
@@ -1108,6 +1256,7 @@ impl LightningManagerProcess {
 						&self.sync_manager,
 						&self.mailbox_manager,
 						&self.settler,
+						&self.payment_guards,
 					).await {
 						Ok(id) => {
 							info!("Successfully connected to CLN node at {}", uri);

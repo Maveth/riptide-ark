@@ -3,15 +3,12 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use chrono::Local;
-use hickory_resolver::TokioResolver;
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
 use ark::integration::{TokenStatus, TokenType};
 
 use crate::Server;
 use crate::database::intman::model::{Integration, IntegrationApiKey, IntegrationToken};
-use crate::filters::Filters;
+use crate::filters::{system_resolver, Filters};
 
 // These two UUIDs are provisioned by migration V19 as the daemon's and CLI's
 // built-in integration API keys. They are intentionally hardcoded, non-secret
@@ -120,21 +117,18 @@ impl Server {
 		if status == integration_token.status {
 			return Ok(integration_token);
 		}
-
+		if integration_token.status == TokenStatus::Abused {
+			return badarg!("You cannot change a token that is flagged as abused");
+		}
 
 		match status {
-			TokenStatus::Abused => {}
-			TokenStatus::Disabled => {
-				if integration_token.status == TokenStatus::Abused {
-					bail!("You cannot disable a token that is flagged as abused")
-				}
-			}
+			TokenStatus::Abused | TokenStatus::Disabled => {}
 			TokenStatus::Unused => {
-				bail!("You cannot mark a token unused")
+				return badarg!("You cannot mark a token unused");
 			}
 			TokenStatus::Used => {
 				if integration_token.is_expired() {
-					bail!("Token is expired")
+					return badarg!("Token is expired");
 				}
 			}
 		};
@@ -190,12 +184,7 @@ impl Server {
 
 						let client_address = client_address.unwrap();
 
-						let resolver = TokioResolver::builder_with_config(
-							ResolverConfig::default(),
-							TokioRuntimeProvider::default(),
-						).build()?;
-
-						if !integration_api_key.filters.allowed(&resolver, &client_address).await {
+						if !integration_api_key.filters.allowed(system_resolver()?, &client_address).await {
 							return badarg!("Client's address is not allowed");
 						}
 

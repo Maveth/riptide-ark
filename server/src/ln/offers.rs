@@ -250,7 +250,26 @@ impl crate::Server {
 			hold.inject(hold::InjectRequest { invoice: invoice.to_string(), min_cltv_expiry: Some(u64::from(cltv)) }).await?;
 		}
 		let agent = crate::telemetry::current_user_agent();
-		self.db.write(async |t| t.store_generated_lightning_receive(node.id, &invoice, msat, mailbox.as_ref(), agent.as_deref()).await).await?;
+		let expires_at = bolt12.created_at().checked_add(bolt12.relative_expiry())
+			.and_then(|d| i64::try_from(d.as_secs()).ok())
+			.and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+			.map(|dt| dt.with_timezone(&chrono::Local))
+			.context("invoice expiry out of range")?;
+		let new_hold = database::hold::NewClnHold {
+			lightning_node_id: node.id,
+			invoice: invoice.to_string(),
+			payment_hash: hash,
+			requested_amount_msat: msat,
+			min_final_cltv_delta: cltv,
+			expires_at,
+		};
+		self.db.write(async |t| {
+			t.store_generated_lightning_receive(
+				node.id, &invoice, msat, mailbox.as_ref(), None, agent.as_deref(),
+			).await?;
+			database::hold::create_hold(&**t, &new_hold).await?;
+			Ok(())
+		}).await?;
 		Ok(())
 	}
 }
