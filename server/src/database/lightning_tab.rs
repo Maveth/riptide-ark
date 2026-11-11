@@ -271,6 +271,62 @@ impl Tx<'_> {
 		self.lightning_tab_balance(user).await
 	}
 
+	pub async fn claim_lightning_address(
+		&self, name: &str, user: &PublicKey,
+	) -> anyhow::Result<Result<(), String>> {
+		let taken = self.query_opt(
+			"SELECT user_pubkey FROM lightning_address WHERE name = $1",
+			&[&name],
+		).await?;
+		if let Some(row) = taken {
+			let owner: String = row.get(0);
+			if owner != user.to_string() {
+				return Ok(Err("that name is already taken".into()));
+			}
+		}
+		self.execute("DELETE FROM lightning_address WHERE user_pubkey = $1", &[&user.to_string()]).await?;
+		self.execute(
+			"INSERT INTO lightning_address (name, user_pubkey) VALUES ($1, $2)",
+			&[&name, &user.to_string()],
+		).await?;
+		Ok(Ok(()))
+	}
+
+	pub async fn lightning_address_for_user(&self, user: &PublicKey) -> anyhow::Result<Option<String>> {
+		let row = self.query_opt(
+			"SELECT name FROM lightning_address WHERE user_pubkey = $1",
+			&[&user.to_string()],
+		).await?;
+		Ok(row.map(|row| row.get(0)))
+	}
+
+	pub async fn lightning_address_owner(&self, name: &str) -> anyhow::Result<Option<String>> {
+		let row = self.query_opt(
+			"SELECT user_pubkey FROM lightning_address WHERE name = $1",
+			&[&name],
+		).await?;
+		Ok(row.map(|row| row.get(0)))
+	}
+
+	pub async fn store_lightning_address_invoice(
+		&self, hash: &PaymentHash, name: &str, user: &str, amount: i64, preimage: Option<&[u8]>,
+	) -> anyhow::Result<()> {
+		self.execute(
+			"INSERT INTO lightning_address_invoice (payment_hash, name, user_pubkey, amount_sat, preimage)
+			 VALUES ($1, $2, $3, $4, $5)",
+			&[&hash.to_string(), &name, &user, &amount, &preimage],
+		).await?;
+		Ok(())
+	}
+
+	pub async fn lightning_address_preimage(&self, hash: &PaymentHash) -> anyhow::Result<Option<Vec<u8>>> {
+		let row = self.query_opt(
+			"SELECT preimage FROM lightning_address_invoice WHERE payment_hash = $1",
+			&[&hash.to_string()],
+		).await?;
+		Ok(row.and_then(|row| row.get(0)))
+	}
+
 	pub async fn register_lightning_tab_receive(
 		&self, hash: PaymentHash, user: &PublicKey, amount: i64,
 	) -> anyhow::Result<()> {

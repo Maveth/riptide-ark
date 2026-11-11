@@ -1,5 +1,6 @@
 pub mod node_manager;
 pub mod offers;
+pub(crate) mod address;
 pub(crate) mod tab;
 
 pub mod cln;

@@ -389,6 +389,13 @@ impl ClnHoldProcess {
 			post_lightning_receive_notification(
 				&self.db, &self.mailbox_manager, payment_hash, htlc_subscription.amount(),
 			).await;
+			if let Some(hold) = self.hold_rpc.as_mut() {
+				if let Err(err) = crate::ln::address::settle_held_tab(
+					&self.db, hold, payment_hash, htlc_subscription.id,
+				).await {
+					warn!("could not credit a lightning-address tab payment: {err:#}");
+				}
+			}
 		}
 
 		Ok(status == LightningHtlcSubscriptionStatus::Accepted)

@@ -49,6 +49,12 @@ service ArkService {
 	// Pay tab balance back into a coin while the server is up.
 	rpc WithdrawLightningTab(WithdrawLightningTabRequest) returns (WithdrawLightningTabResponse) {}
 	rpc SetLightningTabOptOut(SetLightningTabOptOutRequest) returns (LightningTabBalance) {}
+	// Claim a Lightning address name for this key. The first claim keeps it.
+	rpc ClaimLightningAddress(ClaimLightningAddressRequest) returns (LightningAddress) {}
+	rpc GetLightningAddress(LightningTabAuth) returns (LightningAddress) {}
+	// Blocks until a payer asks for a coin-sized invoice, or returns 0 on timeout.
+	rpc WaitLightningAddressCoin(LightningTabAuth) returns (LightningAddressCoin) {}
+	rpc SubmitLightningAddressInvoice(SubmitLightningAddressInvoiceRequest) returns (core.Empty) {}
 	rpc SettleLightningTabReceive(SettleLightningTabReceiveRequest) returns (LightningTabBalance) {}
 	rpc InitiateLightningPayment(InitiateLightningPaymentRequest) returns (core.Empty) {}
 	rpc CheckLightningPayment(CheckLightningPaymentRequest) returns (LightningPaymentStatus) {}
@@ -336,6 +342,25 @@ message QuoteLightningSendResponse {
 message LightningTabAuth {
 	bytes user_pubkey = 1;
 	bytes signature = 2;
+}
+
+message ClaimLightningAddressRequest {
+	LightningTabAuth auth = 1;
+	string name = 2;
+}
+
+message LightningAddress {
+	string name = 1;
+	string address = 2;
+}
+
+message LightningAddressCoin {
+	uint64 amount_sat = 1;
+}
+
+message SubmitLightningAddressInvoiceRequest {
+	LightningTabAuth auth = 1;
+	string bolt11 = 2;
 }
 
 message LightningTabsRequest {

@@ -261,6 +261,49 @@ impl rpc::server::ArkService for Server {
 	}
 
 	#[tracing::instrument(skip(self, req))]
+	async fn claim_lightning_address(
+		&self, req: tonic::Request<protos::ClaimLightningAddressRequest>,
+	) -> Result<tonic::Response<protos::LightningAddress>, tonic::Status> {
+		let req = req.into_inner();
+		let auth = req.auth.ok_or_else(|| tonic::Status::invalid_argument("missing signature"))?;
+		let user = bitcoin::secp256k1::PublicKey::from_slice(&auth.user_pubkey)
+			.map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+		let address = self.claim_lightning_address(&req.name, user, &auth.signature).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningAddress { name: req.name, address }))
+	}
+
+	async fn get_lightning_address(
+		&self, req: tonic::Request<protos::LightningTabAuth>,
+	) -> Result<tonic::Response<protos::LightningAddress>, tonic::Status> {
+		let auth = req.into_inner();
+		let user = bitcoin::secp256k1::PublicKey::from_slice(&auth.user_pubkey)
+			.map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+		let address = self.lightning_address_of(user, &auth.signature).await.to_status()?;
+		let name = address.split('@').next().filter(|s| !s.is_empty()).unwrap_or("").to_string();
+		Ok(tonic::Response::new(protos::LightningAddress { name, address }))
+	}
+
+	async fn wait_lightning_address_coin(
+		&self, req: tonic::Request<protos::LightningTabAuth>,
+	) -> Result<tonic::Response<protos::LightningAddressCoin>, tonic::Status> {
+		let auth = req.into_inner();
+		let user = bitcoin::secp256k1::PublicKey::from_slice(&auth.user_pubkey)
+			.map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+		let amount_sat = self.wait_lightning_address_coin(user, &auth.signature).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningAddressCoin { amount_sat }))
+	}
+
+	async fn submit_lightning_address_invoice(
+		&self, req: tonic::Request<protos::SubmitLightningAddressInvoiceRequest>,
+	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		let req = req.into_inner();
+		let auth = req.auth.ok_or_else(|| tonic::Status::invalid_argument("missing signature"))?;
+		let user = bitcoin::secp256k1::PublicKey::from_slice(&auth.user_pubkey)
+			.map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+		self.submit_lightning_address_invoice(user, &auth.signature, &req.bolt11).await.to_status()?;
+		Ok(tonic::Response::new(protos::Empty {}))
+	}
+
 	async fn get_lightning_tabs(
 		&self,
 		req: tonic::Request<protos::LightningTabsRequest>,
@@ -1070,6 +1113,12 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 
 	let addr = srv.config.rpc.public_address;
 	info!("Starting public gRPC service on address {}", addr);
+	let http = srv.clone();
+	tokio::spawn(async move {
+		if let Err(err) = crate::ln::address::serve(http).await {
+			tracing::error!("Lightning address pages stopped: {err:#}");
+		}
+	});
 
 	let (_, health_server) = tonic_health::server::health_reporter();
 

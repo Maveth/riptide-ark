@@ -69,6 +69,18 @@ use crate::telemetry;
 
 use super::payment_handler::PaymentAttemptHandler;
 
+/// Amount that must arrive at the first hint node so the private hops can
+/// deliver `amount_msat` after their own fees.
+fn hint_amount_in(amount_msat: u64, hops: &[(u32, u32)]) -> Option<u64> {
+	let mut out = amount_msat;
+	for (base_msat, proportional_millionths) in hops.iter().rev() {
+		let prop = out.checked_mul(u64::from(*proportional_millionths))? / 1_000_000;
+		let fee = u64::from(*base_msat).checked_add(prop)?;
+		out = out.checked_add(fee)?;
+	}
+	Some(out)
+}
+
 fn route_fee_sat(routes: &[cln_rpc::GetroutesRoutes]) -> Option<Amount> {
 	if routes.is_empty() {
 		return None;
@@ -288,9 +300,6 @@ impl LightningManager {
 		&self, invoice: &Invoice, amount: Amount, expiry: BlockHeight,
 	) -> anyhow::Result<Option<Amount>> {
 		let Invoice::Bolt11(inv) = invoice else { return Ok(None) };
-		if !inv.route_hints().is_empty() {
-			return Ok(None);
-		}
 		let Some(node) = self.active_node() else { return Ok(None) };
 		let mut rpc = node.rpc.clone();
 		let tip = rpc.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner().blockheight;
@@ -304,15 +313,57 @@ impl LightningManager {
 		if u64::from(final_cltv) > u64::from(delay) {
 			return Ok(None);
 		}
+		let hints = inv.route_hints();
+		if hints.is_empty() {
+			return self.public_route_fee(&mut rpc, &node.pubkey, &inv.recover_payee_pub_key(), amount, final_cltv, delay).await;
+		}
+		// A hint is the private last hop. Price the public route to the node
+		// that starts the hint, then add the fee that hop itself charges.
+		let mut best: Option<u64> = None;
+		let amount_msat = amount.to_sat().saturating_mul(1000);
+		for hint in hints {
+			let hops = &hint.0;
+			let Some(intro) = hops.first() else { continue };
+			let fees: Vec<(u32, u32)> = hops.iter().map(|hop| (hop.fees.base_msat, hop.fees.proportional_millionths)).collect();
+			let Some(arrive) = hint_amount_in(amount_msat, &fees) else { continue };
+			let public_fee = if intro.src_node_id == node.pubkey {
+				Some(0)
+			} else {
+				self.public_route_fee_msat(
+					&mut rpc, &node.pubkey, &intro.src_node_id,
+					Amount::from_sat(arrive.div_ceil(1000)), final_cltv, delay,
+				).await?
+			};
+			let Some(public_fee) = public_fee else { continue };
+			let total = public_fee.checked_add(arrive.saturating_sub(amount_msat));
+			if let Some(total) = total {
+				best = Some(best.map(|old| old.min(total)).unwrap_or(total));
+			}
+		}
+		Ok(best.map(|msat| Amount::from_sat(msat.div_ceil(1000))))
+	}
+
+	async fn public_route_fee(
+		&self, rpc: &mut cln_rpc::ClnGrpcClient, source: &bitcoin::secp256k1::PublicKey,
+		destination: &bitcoin::secp256k1::PublicKey, amount: Amount, final_cltv: u32, delay: u32,
+	) -> anyhow::Result<Option<Amount>> {
+		Ok(self.public_route_fee_msat(rpc, source, destination, amount, final_cltv, delay).await?
+			.map(|msat| Amount::from_sat(msat.div_ceil(1000))))
+	}
+
+	async fn public_route_fee_msat(
+		&self, rpc: &mut cln_rpc::ClnGrpcClient, source: &bitcoin::secp256k1::PublicKey,
+		destination: &bitcoin::secp256k1::PublicKey, amount: Amount, final_cltv: u32, delay: u32,
+	) -> anyhow::Result<Option<u64>> {
 		// The cap only lets the search see a normal route. The user is charged
 		// the route that comes back, plus 1 sat, not this cap.
 		let request = cln_rpc::GetroutesRequest {
-			source: node.pubkey.serialize().to_vec(),
-			destination: inv.recover_payee_pub_key().serialize().to_vec(),
+			source: source.serialize().to_vec(),
+			destination: destination.serialize().to_vec(),
 			amount_msat: Some(amount.into()),
 			layers: vec!["auto.localchans".into(), "auto.sourcefree".into(), "xpay".into()],
 			maxfee_msat: Some(Amount::from_sat(100_000).into()),
-			final_cltv, maxdelay: Some(u32::try_from(delay).unwrap_or(u32::MAX)),
+			final_cltv, maxdelay: Some(delay),
 			maxparts: None,
 		};
 		let routes = match tokio::time::timeout(Duration::from_secs(10), rpc.get_routes(request)).await {
@@ -323,7 +374,7 @@ impl LightningManager {
 			},
 			Err(_) => return Ok(None),
 		};
-		Ok(route_fee_sat(&routes))
+		Ok(route_fee_sat(&routes).map(|fee| fee.to_sat().saturating_mul(1000)))
 	}
 
 	/// Pays a bolt-11 invoice
