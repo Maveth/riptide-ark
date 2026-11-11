@@ -39,7 +39,7 @@ pub const OFFBOARD_TX_CONNECTOR_VOUT: usize = 1;
 
 /// Additional number of blocks after the input VTXO expiry we wait to sweep connectors
 /// Profile 2 connector covers a 500-sat fee, 500-sat public anchor and 330-sat continuation.
-const STANDARD_CONNECTOR_VALUE: Amount = Amount::from_sat(1330);
+const STANDARD_CONNECTOR_VALUE: Amount = Amount::from_sat(430);
 
 pub fn standard_connector_budget(count: usize) -> Option<Amount> {
 	if count == 0 { return None; }
@@ -240,7 +240,7 @@ impl<'a, V> OffboardForfeitContext<'a, V> {
 		if self.exit_format == fee::ExitFormat::StandardV2 {
 			tx.version = bitcoin::transaction::Version::TWO;
 			for out in tx.output.iter_mut().take(self.input_vtxos.len()) { out.value = STANDARD_CONNECTOR_VALUE; }
-			*tx.output.last_mut().expect("fanout has an anchor") = self.exit_format.anchor(Amount::from_sat(1000));
+			*tx.output.last_mut().expect("fanout has an anchor") = self.exit_format.anchor(crate::exit_policy::RECOVERY_MINER_FEE);
 		}
 		tx
 	}

@@ -2927,3 +2927,42 @@ CREATE TABLE lightning_failure_credit (
 	CHECK (reimbursement_vtxos IS NULL OR
 		(approved AND refund_vtxo_id IS NOT NULL AND cardinality(reimbursement_vtxos) > 0))
 );
+
+CREATE TABLE lightning_tab (
+	user_pubkey TEXT PRIMARY KEY,
+	balance_sat BIGINT NOT NULL CHECK (balance_sat >= 0),
+	opted_out BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE lightning_tab_fund (
+	vtxo_id TEXT PRIMARY KEY,
+	user_pubkey TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
+	credited BOOLEAN NOT NULL DEFAULT FALSE,
+	returned BOOLEAN NOT NULL DEFAULT FALSE,
+	return_vtxo_id TEXT
+);
+
+CREATE TABLE lightning_tab_return (
+	dest_pubkey TEXT NOT NULL,
+	user_pubkey TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
+	vtxo_id TEXT NOT NULL,
+	PRIMARY KEY (dest_pubkey, vtxo_id)
+);
+
+CREATE TABLE lightning_tab_payment (
+	payment_hash TEXT PRIMARY KEY,
+	user_pubkey TEXT NOT NULL,
+	invoice TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
+	fee_sat BIGINT NOT NULL CHECK (fee_sat >= 0),
+	status TEXT NOT NULL CHECK (status IN ('spent', 'refunded'))
+);
+
+CREATE TABLE lightning_tab_receive (
+	payment_hash TEXT PRIMARY KEY,
+	user_pubkey TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
+	credited BOOLEAN NOT NULL DEFAULT FALSE
+);

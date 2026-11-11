@@ -53,12 +53,12 @@ fn create_hark_forfeit_tx_with_format<G>(
 		],
 		output: vec![
 			TxOut {
-				value: vtxo.amount() - if format == fee::ExitFormat::StandardV2 { Amount::from_sat(1000) } else { Amount::ZERO },
+				value: vtxo.amount() - if format == fee::ExitFormat::StandardV2 { Amount::from_sat(430) } else { Amount::ZERO },
 				script_pubkey: claim_policy
 					.taproot(vtxo.server_pubkey(), vtxo.exit_delta())
 					.script_pubkey(),
 			},
-			format.anchor(if format == fee::ExitFormat::StandardV2 { Amount::from_sat(500) } else { Amount::ZERO }),
+			format.anchor(if format == fee::ExitFormat::StandardV2 { bitcoin_ext::P2TR_DUST } else { Amount::ZERO }),
 		],
 	}
 }
@@ -100,7 +100,7 @@ fn build_internal_forfeit_vtxo(
 			items: vtxo.genesis.items.iter().cloned().chain([
 				GenesisItem {
 					exit_format: format,
-					miner_fee: if format == fee::ExitFormat::StandardV2 { Amount::from_sat(500) } else { Amount::ZERO },
+					miner_fee: if format == fee::ExitFormat::StandardV2 { crate::exit_policy::RECOVERY_MINER_FEE } else { Amount::ZERO },
 					transition: GenesisTransition::Arkoor(ArkoorGenesis {
 						client_cosigners: vec![vtxo.user_pubkey()],
 						tap_tweak: vtxo.output_taproot().tap_tweak(),
@@ -108,12 +108,12 @@ fn build_internal_forfeit_vtxo(
 					}),
 					output_idx: 0,
 					other_outputs: vec![],
-					fee_amount: if format == fee::ExitFormat::StandardV2 { Amount::from_sat(500) } else { Amount::ZERO },
+					fee_amount: if format == fee::ExitFormat::StandardV2 { bitcoin_ext::P2TR_DUST } else { Amount::ZERO },
 				}
 			]).collect(),
 		},
 
-		amount: vtxo.amount - if format == fee::ExitFormat::StandardV2 { Amount::from_sat(1000) } else { Amount::ZERO },
+		amount: vtxo.amount - if format == fee::ExitFormat::StandardV2 { Amount::from_sat(430) } else { Amount::ZERO },
 		expiry_height: vtxo.expiry_height,
 		server_pubkey: vtxo.server_pubkey,
 		exit_delta: vtxo.exit_delta,
@@ -137,7 +137,7 @@ impl HashLockedForfeitBundle {
 	pub fn new_standard<G>(vtxo: &Vtxo<G>, unlock_hash: UnlockHash,
 		user_key: &Keypair, server_nonce: &musig::PublicNonce,
 	) -> Result<Self, &'static str> {
-		if vtxo.amount() < Amount::from_sat(1330) { return Err("insufficient funded forfeit reserve"); }
+		if vtxo.amount() < Amount::from_sat(430) { return Err("insufficient funded forfeit reserve"); }
 		Ok(Self::new_with_format(vtxo, unlock_hash, user_key, server_nonce, fee::ExitFormat::StandardV2))
 	}
 
@@ -189,7 +189,7 @@ impl HashLockedForfeitBundle {
 		vtxo: &Vtxo<G>,
 		server_nonce: &musig::PublicNonce,
 	) -> Result<(), &'static str> {
-		if self.exit_format == fee::ExitFormat::StandardV2 && vtxo.amount() < Amount::from_sat(1330) {
+		if self.exit_format == fee::ExitFormat::StandardV2 && vtxo.amount() < Amount::from_sat(430) {
 			return Err("insufficient funded forfeit reserve");
 		}
 		if vtxo.id() != self.vtxo_id {
@@ -437,10 +437,10 @@ mod test {
 		assert!(bundle.verify(vtxo, &public).is_ok());
 		let (_, tx, internal) = bundle.finish(vtxo, &public, secret, &VTXO_VECTORS.server_key);
 		assert_eq!(tx.version, bitcoin::transaction::Version::TWO);
-		assert_eq!(vtxo.amount() - tx.output.iter().map(|o| o.value).sum::<Amount>(), Amount::from_sat(500));
+		assert_eq!(vtxo.amount() - tx.output.iter().map(|o| o.value).sum::<Amount>(), Amount::from_sat(100));
 		assert!(tx.output.iter().all(|o| o.value >= o.script_pubkey.minimal_non_dust()));
 		assert_eq!(internal.transactions().last().unwrap().tx, tx);
-		assert_eq!(internal.amount(), vtxo.amount() - Amount::from_sat(1000));
+		assert_eq!(internal.amount(), vtxo.amount() - Amount::from_sat(430));
 		for n in 0..encoded.len() { assert!(HashLockedForfeitBundle::deserialize(&encoded[..n]).is_err()); }
 	}
 

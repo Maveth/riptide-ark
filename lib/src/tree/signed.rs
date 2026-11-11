@@ -183,10 +183,10 @@ impl TreeExitFunding {
 	}
 
 	pub fn new(anchor: Amount, miner_fee: Amount) -> Result<Self, &'static str> {
-		// A four-way tree node and the supported hashlocked leaves are below
-		// 1,000 vbytes. Reserve at least this much for the 1 sat/vB profile.
-		if anchor < bitcoin_ext::P2TR_DUST || miner_fee < Amount::from_sat(1000) {
-			return Err("tree exit needs non-dust anchors and at least 1000 sats per transaction");
+		// Zero anchor and zero miner fee is the version-3 pay-to-anchor parent.
+		// A non-zero anchor still has to be a real output.
+		if anchor != Amount::ZERO && anchor < bitcoin_ext::P2TR_DUST {
+			return Err("tree exit anchor must be zero or at least dust");
 		}
 		anchor.checked_add(miner_fee).filter(|a| *a <= Amount::MAX_MONEY)
 			.ok_or("exit reserve overflow")?;
@@ -2025,8 +2025,8 @@ mod test {
 				encoding_roundtrip(&vtxo);
 			}
 		}
-		assert!(TreeExitFunding::new(Amount::ZERO, Amount::from_sat(1000)).is_err());
-		assert!(TreeExitFunding::new(Amount::from_sat(330), Amount::ZERO).is_err());
+		assert!(TreeExitFunding::new(Amount::ZERO, Amount::from_sat(1000)).is_ok());
+		assert!(TreeExitFunding::new(Amount::from_sat(1), Amount::ZERO).is_err());
 		assert!(TreeExitFunding::new(Amount::MAX_MONEY, Amount::MAX_MONEY).is_err());
 	}
 	#[test]
@@ -2074,8 +2074,8 @@ mod test {
 				encoding_roundtrip(&vtxo);
 			}
 		}
-		assert!(TreeExitFunding::new(Amount::ZERO, Amount::from_sat(1000)).is_err());
-		assert!(TreeExitFunding::new(Amount::from_sat(330), Amount::ZERO).is_err());
+		assert!(TreeExitFunding::new(Amount::ZERO, Amount::from_sat(1000)).is_ok());
+		assert!(TreeExitFunding::new(Amount::from_sat(1), Amount::ZERO).is_err());
 		assert!(TreeExitFunding::new(Amount::MAX_MONEY, Amount::MAX_MONEY).is_err());
 	}
 

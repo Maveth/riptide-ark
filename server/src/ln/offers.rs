@@ -216,9 +216,27 @@ impl crate::Server {
 		ensure!(msat > 0 && msat % 1000 == 0, "invoice must be whole sats");
 		let amount = bitcoin::Amount::from_sat(msat / 1000);
 		crate::check_max_amount("lightning receive", amount, self.config.max_ln_receive_amount)?;
-		crate::check_max_amount("lightning receive", amount, self.config.max_vtxo_amount)?;
-		let fee = self.config.fees.lightning_receive.calculate(amount).context("fee overflow")?;
-		ark::fees::validate_and_subtract_fee(amount, fee)?;
+		let hash = invoice.payment_hash();
+		let tab_user = if amount < ark::lightning::lightning_tab_floor() {
+			let user = PublicKey::from_slice(request.tab_user_pubkey.as_deref()
+				.context("a receive under the dust floor must name the tab key")?)
+				.context("invalid tab user pubkey")?;
+			let signature = request.tab_signature.as_deref()
+				.context("a receive under the dust floor must be signed")?;
+			crate::ln::tab::verify_tab_signature(&user, signature, "receive", hash.as_ref())?;
+			if self.lightning_tab_is_opted_out(user).await? {
+				return badarg!("this key opted out of small Lightning payments");
+			}
+			Some(user)
+		} else {
+			if request.tab_user_pubkey.is_some() || request.tab_signature.is_some() {
+				return badarg!("a receive of {} sats is a coin, not a tab credit", amount.to_sat());
+			}
+			crate::check_max_amount("lightning receive", amount, self.config.max_vtxo_amount)?;
+			let fee = self.config.fees.lightning_receive.calculate(amount).context("fee overflow")?;
+			ark::fees::validate_and_subtract_fee(amount, fee)?;
+			None
+		};
 		let delta = bitcoin_ext::BlockDelta::try_from(request.min_cltv_delta)?;
 		ensure!(u16::from(delta) > 0 && delta <= self.config.max_user_invoice_cltv_delta, "CLTV outside limits");
 		let cltv = delta.checked_add(self.config.htlc_expiry_delta).context("CLTV overflow")?;
@@ -229,7 +247,6 @@ impl crate::Server {
 		ensure!(path.payinfo.cltv_expiry_delta == u16::from(cltv), "payment path CLTV mismatch");
 		ensure!(path.payinfo.fee_base_msat == 0 && path.payinfo.fee_proportional_millionths == 0, "unexpected relay fee");
 		let mailbox = request.mailbox_id.as_deref().map(ark::mailbox::MailboxIdentifier::deserialize).transpose()?;
-		let hash = invoice.payment_hash();
 		let _guard = self.payment_guards.lock(hash).await;
 		ensure!(self.htlc_settler.is_settled(hash).await?.is_none(), "invoice already settled");
 		ensure!(self.db.read(async |t| t.get_round_participation_by_unlock_hash(hash.to_sha256_hash()).await).await?.is_none(), "hash collides with unlock hash");
@@ -238,6 +255,10 @@ impl crate::Server {
 			ensure!(existing.status == LightningHtlcSubscriptionStatus::Created, "receive already used or canceled");
 			let existing_mailbox = self.db.read(async |t| t.get_lightning_receiver_mailbox_id(hash).await).await?;
 			ensure!(existing_mailbox == mailbox, "receive mailbox mismatch");
+			if let Some(user) = tab_user.as_ref() {
+				let amount_sat = i64::try_from(amount.to_sat())?;
+				self.db.write(async |t| t.register_lightning_tab_receive(hash, user, amount_sat).await).await?;
+			}
 			return Ok(());
 		}
 		let mut hold = node.hold_rpc.context("hold unavailable")?;
@@ -250,7 +271,14 @@ impl crate::Server {
 			hold.inject(hold::InjectRequest { invoice: invoice.to_string(), min_cltv_expiry: Some(u64::from(cltv)) }).await?;
 		}
 		let agent = crate::telemetry::current_user_agent();
-		self.db.write(async |t| t.store_generated_lightning_receive(node.id, &invoice, msat, mailbox.as_ref(), agent.as_deref()).await).await?;
+		let amount_sat = i64::try_from(amount.to_sat())?;
+		self.db.write(async |t| {
+			t.store_generated_lightning_receive(node.id, &invoice, msat, mailbox.as_ref(), agent.as_deref()).await?;
+			if let Some(user) = tab_user.as_ref() {
+				t.register_lightning_tab_receive(hash, user, amount_sat).await?;
+			}
+			Ok(())
+		}).await?;
 		Ok(())
 	}
 }

@@ -35,6 +35,31 @@ pub(crate) struct ArkoorCosignRequestValidationParams {
 	pub max_input_exit_depth: Option<u16>,
 }
 
+/// A 1,000 sat output to the server pubkey funds the sender's Lightning tab.
+/// The ledger is credited only after that output's signed chain is registered.
+fn lightning_tab_funds(
+	builder: &ArkoorPackageBuilder<ServerCanCosign>,
+	server: bitcoin::secp256k1::PublicKey,
+) -> Vec<(bitcoin::secp256k1::PublicKey, VtxoId)> {
+	let chunk = bitcoin::Amount::from_sat(ark::lightning::LIGHTNING_TAB_CHUNK_SAT);
+	let mut funds = Vec::new();
+	for part in &builder.builders {
+		if !matches!(part.input().policy(), VtxoPolicy::Pubkey(_)) {
+			continue;
+		}
+		let user = part.input().policy().user_pubkey();
+		if user == server {
+			continue;
+		}
+		for vtxo in part.build_unsigned_vtxos() {
+			if vtxo.amount() == chunk && vtxo.policy().arkoor_pubkey() == Some(server) {
+				funds.push((user, vtxo.id()));
+			}
+		}
+	}
+	funds
+}
+
 impl Server {
 	/// Validate the cosign request for the given validation params
 	///
@@ -63,10 +88,16 @@ impl Server {
 			let ordinary = matches!(request.input.policy(), VtxoPolicy::Pubkey(_))
 				&& request.outputs.iter().all(|o| matches!(&o.policy, VtxoPolicy::Pubkey(_)))
 				&& request.isolated_outputs.is_empty();
+			// See the update path on `PAPERCLIP_EXIT_PROFILE`. Zero-fee is ours.
+			// The two legacy profiles are what older wallets still sign.
 			ensure!(request.exit_funding == Some(ark::exit_policy::paperclip_funding())
-				|| (ordinary && request.exit_funding == Some(ark::exit_policy::small_anchor_transfer_funding()))
-				|| (ordinary && self.config.experimental_economical_transfers
-					&& request.exit_funding == Some(ark::exit_policy::economical_transfer_funding())),
+				|| request.exit_funding == Some(ark::exit_policy::legacy_standard_funding())
+				|| (ordinary && (
+					request.exit_funding == Some(ark::exit_policy::small_anchor_transfer_funding())
+					|| request.exit_funding == Some(ark::exit_policy::legacy_small_anchor_funding())
+					|| (self.config.experimental_economical_transfers
+						&& request.exit_funding == Some(ark::exit_policy::economical_transfer_funding()))
+				)),
 				"funded recovery profile required");
 		}
 		// then we create the builder
@@ -161,8 +192,14 @@ impl Server {
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_oor_spent(builder.input_spend_info());
+		let tab_funds = lightning_tab_funds(&builder, self.server_pubkey());
 		let inserted = self.db.write(async |t| {
 			let inserted = t.execute_vtxo_tree_update(update).await?;
+			if inserted > 0 {
+				for (user, vtxo) in &tab_funds {
+					t.stage_lightning_tab_fund(user, *vtxo).await?;
+				}
+			}
 			for part in &builder.builders {
 				let htlcs = part.build_unsigned_vtxos().filter(|v|
 					matches!(v.policy(), VtxoPolicy::ServerHtlcSend(_))).collect::<Vec<_>>();

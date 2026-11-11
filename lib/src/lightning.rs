@@ -23,6 +23,30 @@ const BECH32_BOLT12_INVOICE_HRP: &str = "lni";
 /// The minimum fee we consider for an HTLC transaction.
 pub const HTLC_MIN_FEE: Amount = P2TR_DUST;
 
+/// One custodial Lightning tab is funded by an Ark payment of this size.
+pub const LIGHTNING_TAB_CHUNK_SAT: u64 = 1_000;
+
+/// Lightning payments under 1,000 sats use the tab.
+/// A coin can exist from the dust recovery floor, but a pool payment under
+/// 1,000 sats can leave an output below dust. 1,000 sats and above stay on
+/// the HTLC path.
+pub fn lightning_tab_floor() -> Amount {
+	Amount::from_sat(LIGHTNING_TAB_CHUNK_SAT)
+}
+
+/// Schnorr message for the Lightning tab.
+/// `action` is `balance`, `forfeit`, `pay`, `receive`, `receive-settle`, or `opt`.
+/// `pay` binds the invoice. `receive` and `receive-settle` bind the payment hash.
+/// `opt` binds one byte, 0 or 1.
+pub fn lightning_tab_message(action: &str, payload: &[u8]) -> Message {
+	let mut body = Vec::with_capacity(32 + action.len() + payload.len());
+	body.extend_from_slice(b"riptide-lightning-tab-v1\0");
+	body.extend_from_slice(action.as_bytes());
+	body.extend_from_slice(b"\0");
+	body.extend_from_slice(payload);
+	Message::from_digest(sha256::Hash::hash(&body).to_byte_array())
+}
+
 pub const PREIMAGE_SIZE: usize = 32;
 pub const PAYMENT_HASH_SIZE: usize = 32;
 

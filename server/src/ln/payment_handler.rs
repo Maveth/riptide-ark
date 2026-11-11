@@ -36,9 +36,13 @@ impl<'a> PaymentAttemptHandler<'a> {
 		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
 		let new_status = LightningPaymentStatus::Failed;
-		let updated_at = self.db.write(async |t|
-			t.update_lightning_payment_attempt_status(attempt, new_status, error).await
-		).await?;
+		let updated_at = self.db.write(async |t| {
+			let updated_at = t.update_lightning_payment_attempt_status(attempt, new_status, error).await?;
+			if updated_at.is_some() {
+				t.refund_lightning_tab(&attempt.payment_hash).await?;
+			}
+			Ok(updated_at)
+		}).await?;
 
 		if updated_at.is_some() {
 			trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
@@ -105,6 +109,17 @@ impl<'a> PaymentAttemptHandler<'a> {
 			// update has actually committed in this transaction; a lost
 			// optimistic-lock race would otherwise leave the vtxos flagged
 			// ln-spent for an attempt we did not transition.
+			if updated && status == LightningPaymentStatus::Failed {
+				t.refund_lightning_tab(&attempt.payment_hash).await?;
+			}
+			if updated && status == LightningPaymentStatus::Succeeded {
+				if let Some(user_fee) = attempt.user_fee {
+					let routing = attempt.routing_fee_sat_from(final_amount_msat);
+					let kept = routing.saturating_add(1).min(user_fee.to_sat());
+					let kept = i64::try_from(kept).context("settled tab fee overflow")?;
+					t.settle_lightning_tab_fee(&attempt.payment_hash, kept).await?;
+				}
+			}
 			if updated && preimage.is_some() {
 				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.payment_hash).await?;
 				if !not_spendable.is_empty() {

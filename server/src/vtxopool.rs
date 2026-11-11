@@ -309,6 +309,7 @@ impl VtxoPool {
 		dest: ArkoorDestination,
 		inputs: &[(VtxoId, BlockHeight, Amount)],
 		credit: Option<&FailureCredit>,
+		pubkey_payment: bool,
 	) -> anyhow::Result<Vec<Vtxo<Full>>> {
 		let input_ids = inputs.iter().map(|v| v.0).collect::<Vec<_>>();
 		let mut input_vtxos = srv.db.read(async |t| t.get_pool_vtxos_by_ids(&input_ids).await).await?;
@@ -339,7 +340,8 @@ impl VtxoPool {
 		let change_key = srv.generate_ephemeral_cosign_key(self.config.vtxo_key_lifetime()).await?;
 		let full_inputs = input_vtxos.into_iter().map(|v| v.into_inner()).collect();
 		let change_policy = VtxoPolicy::new_pubkey(change_key.public_key());
-		let (builder, _reserve) = if credit.is_some() {
+		let pubkey_payment = pubkey_payment || credit.is_some();
+		let (builder, _reserve) = if pubkey_payment {
 			ArkoorPackageBuilder::new_funded_payment(full_inputs, dest.clone(), change_policy)
 		} else {
 			ArkoorPackageBuilder::new_funded_lightning_receive(full_inputs, dest.clone(), change_policy)
@@ -356,7 +358,7 @@ impl VtxoPool {
 			.partition::<Vec<_>, _>(|v| *v.policy() == dest.policy);
 
 		for vtxo in &sent {
-			if credit.is_some() {
+			if pubkey_payment {
 				ensure!(matches!(vtxo.policy(), VtxoPolicy::Pubkey(_)), "invalid reimbursement destination");
 				ensure!(pool_receive_has_headroom(srv.chain_tip().height.to_u32(),
 					u32::from(vtxo.exit_depth()), u32::from(vtxo.exit_delta().to_u16()),
@@ -457,7 +459,15 @@ impl VtxoPool {
 		srv: &Server,
 		dest: ArkoorDestination,
 	) -> anyhow::Result<Vec<Vtxo<Full>>> {
-		self.send_funded_arkoor(srv, dest, None).await
+		self.send_funded_arkoor(srv, dest, None, false).await
+	}
+
+	/// Pay an ordinary Ark coin from pool liquidity.
+	pub async fn pay_to_pubkey(
+		&self, srv: &Server, dest: ArkoorDestination,
+	) -> anyhow::Result<Vec<Vtxo<Full>>> {
+		ensure!(matches!(&dest.policy, VtxoPolicy::Pubkey(_)), "tab return destination is not a pubkey");
+		self.send_funded_arkoor(srv, dest, None, true).await
 	}
 
 	pub(crate) async fn reimburse(
@@ -471,14 +481,16 @@ impl VtxoPool {
 		ensure!(matches!(&policy, VtxoPolicy::Pubkey(_)), "refund recipient is not a pubkey");
 		self.send_funded_arkoor(srv, ArkoorDestination {
 			total_amount: credit.amount, policy,
-		}, Some(credit)).await
+		}, Some(credit), false).await
 	}
 
 	async fn send_funded_arkoor(
 		&self, srv: &Server, dest: ArkoorDestination, credit: Option<&FailureCredit>,
+		pubkey_payment: bool,
 	) -> anyhow::Result<Vec<Vtxo<Full>>> {
 		ensure!(matches!(&dest.policy, VtxoPolicy::ServerHtlcRecv(_))
-			|| (credit.is_some() && matches!(&dest.policy, VtxoPolicy::Pubkey(_))), "invalid pool destination");
+			|| ((credit.is_some() || pubkey_payment) && matches!(&dest.policy, VtxoPolicy::Pubkey(_))),
+			"invalid pool destination");
 		// Snapshot candidates without holding the mutex across database I/O.
 		let ids = self.data.lock().pool.values().flat_map(|bucket| bucket.values())
 			.flatten().copied().collect::<Vec<_>>();
@@ -512,7 +524,7 @@ impl VtxoPool {
 		}
 
 		// we try, but if we fail, we place back the inputs
-		match self.prepare_arkoor(srv, dest, &inputs, credit).await {
+		match self.prepare_arkoor(srv, dest, &inputs, credit, pubkey_payment).await {
 			Ok(v) => {
 				update_all_bucket_metrics(&self.data);
 				Ok(v)

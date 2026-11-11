@@ -39,6 +39,17 @@ service ArkService {
 	// * SEND LN payments
 
 	rpc RequestLightningPayHtlcCosign(LightningPayHtlcCosignRequest) returns (ArkoorPackageCosignResponse) {}
+	// Price a public route before the user confirms. Does not send a payment.
+	rpc QuoteLightningSend(QuoteLightningSendRequest) returns (QuoteLightningSendResponse) {}
+	// Custodial tab balance. Funding is an Ark payment. Spending is a normal Lightning send.
+	rpc GetLightningTab(LightningTabAuth) returns (LightningTabBalance) {}
+	// Every key in one call. Each entry includes its opt-out flag.
+	rpc GetLightningTabs(LightningTabsRequest) returns (LightningTabsResponse) {}
+	rpc ForfeitLightningTab(LightningTabAuth) returns (LightningTabBalance) {}
+	// Pay tab balance back into a coin while the server is up.
+	rpc WithdrawLightningTab(WithdrawLightningTabRequest) returns (WithdrawLightningTabResponse) {}
+	rpc SetLightningTabOptOut(SetLightningTabOptOutRequest) returns (LightningTabBalance) {}
+	rpc SettleLightningTabReceive(SettleLightningTabReceiveRequest) returns (LightningTabBalance) {}
 	rpc InitiateLightningPayment(InitiateLightningPaymentRequest) returns (core.Empty) {}
 	rpc CheckLightningPayment(CheckLightningPaymentRequest) returns (LightningPaymentStatus) {}
 	rpc RequestLightningPayHtlcRevocation(ArkoorPackageCosignRequest) returns (ArkoorPackageCosignResponse) {}
@@ -230,6 +241,9 @@ message BoardCosignRequest {
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
 	uint32 exit_profile = 7;
+	// Set by a wallet that wants the zero-fee board. Older wallets leave this
+	// unset and receive the 1,000 sat anchor plus 1,000 sat miner-fee board.
+	bool zero_fee_board = 8;
 }
 
 message BoardCosignResponse {
@@ -303,11 +317,86 @@ message LightningPayHtlcCosignRequest {
 	optional uint64 payment_amount_sat = 5;
 }
 
+message QuoteLightningSendRequest {
+	string invoice = 1;
+	// Zero means the invoice's own amount.
+	uint64 amount_sat = 2;
+}
+
+message QuoteLightningSendResponse {
+	bool route_found = 1;
+	uint64 route_fee_sat = 2;
+	// Route fee plus 1 sat when a route was found. Zero when the caller
+	// should use the Lightning fee schedule instead.
+	uint64 user_fee_sat = 3;
+}
+
+// Signed by the VTXO key that funded the tab. `balance` and `forfeit` sign
+// an empty payload. `pay` signs the exact invoice bytes.
+message LightningTabAuth {
+	bytes user_pubkey = 1;
+	bytes signature = 2;
+}
+
+message LightningTabsRequest {
+	repeated LightningTabAuth tabs = 1;
+}
+
+message LightningTabEntry {
+	uint64 balance_sat = 1;
+	bool opted_out = 2;
+}
+
+message LightningTabsResponse {
+	// Same order as the request. A key with no row is 0 and not opted out.
+	repeated LightningTabEntry tabs = 1;
+	uint64 balance_sat = 2;
+	bool opted_out = 3;
+}
+
+message LightningTabBalance {
+	uint64 balance_sat = 1;
+	// Sats removed by this call. Zero for a balance read.
+	uint64 forfeited_sat = 2;
+	bool opted_out = 3;
+}
+
+message WithdrawLightningTabRequest {
+	bytes user_pubkey = 1;
+	bytes signature = 2;
+	// The new coin is paid to this key. The signature is over these bytes.
+	bytes destination_pubkey = 3;
+}
+
+message WithdrawLightningTabResponse {
+	uint64 amount_sat = 1;
+	bytes vtxo = 2;
+	// Every coin paid back. The tab balance comes back in full.
+	repeated bytes vtxos = 3;
+}
+
+message SetLightningTabOptOutRequest {
+	bytes user_pubkey = 1;
+	bytes signature = 2;
+	bool opted_out = 3;
+}
+
+message SettleLightningTabReceiveRequest {
+	bytes payment_hash = 1;
+	bytes payment_preimage = 2;
+	bytes user_pubkey = 3;
+	bytes signature = 4;
+}
+
 message InitiateLightningPaymentRequest {
 	string invoice = 1;
 	repeated bytes htlc_vtxo_ids = 2;
 	uint64 payment_amount_sat = 3;
 	optional bytes mailbox_id = 4;
+	// Set together, and only when no HTLC vtxo is sent. The signature is over
+	// the invoice. The server debits the tab, then uses the normal Lightning send.
+	optional bytes tab_user_pubkey = 5;
+	optional bytes tab_signature = 6;
 }
 
 message CheckLightningPaymentRequest {
@@ -317,6 +406,10 @@ message CheckLightningPaymentRequest {
 
 message PaymentSuccessStatus {
 	bytes preimage = 1;
+	// Set for a tab payment once it has settled. The fee is the route cost
+	// plus 1 sat, after any unused hold has been returned.
+	optional uint64 amount_sat = 2;
+	optional uint64 fee_sat = 3;
 }
 
 message LightningPaymentStatus {
@@ -342,6 +435,10 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
+	// Required when the amount is under the dust floor. The signature is over
+	// the payment hash. The receive credits this key's tab.
+	optional bytes tab_user_pubkey = 6;
+	optional bytes tab_signature = 7;
 }
 
 message StartLightningReceiveResponse {
@@ -726,4 +823,8 @@ message RegisterBolt12ReceiveRequest {
  string invoice = 1;
  uint32 min_cltv_delta = 2;
  optional bytes mailbox_id = 3;
+ // Required together when the invoice is under the dust floor. The signature
+ // is over the payment hash. The receive credits this key's tab.
+ optional bytes tab_user_pubkey = 4;
+ optional bytes tab_signature = 5;
 }

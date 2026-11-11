@@ -101,6 +101,8 @@
 //! [500, 100] directly.
 //!
 
+mod combine;
+
 use bitcoin_ext::unified::UnifiedSighash;
 pub mod package;
 
@@ -1287,14 +1289,29 @@ impl ArkoorBuilder<state::Initial> {
 		input: Vtxo<Full>, outputs: Vec<ArkoorDestination>, isolated_outputs: Vec<ArkoorDestination>,
 		use_checkpoint: bool, exit_funding: Option<crate::tree::signed::TreeExitFunding>,
 	) -> Result<Self, ArkoorConstructionError> {
-		let any_funded = input.genesis.items.iter().any(|i| i.miner_fee != Amount::ZERO);
-		let all_funded = !input.genesis.items.is_empty()
-			&& input.genesis.items.iter().all(|i| i.miner_fee != Amount::ZERO);
-		if (any_funded && exit_funding.is_none()) || (exit_funding.is_some() && !all_funded) {
+		let items = &input.genesis.items;
+		let any_nonzero = items.iter().any(|i| i.miner_fee != Amount::ZERO);
+		let all_nonzero = !items.is_empty()
+			&& items.iter().all(|i| i.miner_fee != Amount::ZERO);
+		// A legacy builder must not spend a chain that already carries miner fees.
+		if any_nonzero && exit_funding.is_none() {
 			return Err(ArkoorConstructionError::IncompatibleExitFunding);
 		}
 		if let Some(funding) = exit_funding {
-			if input.genesis.items.iter().any(|i| i.exit_format != funding.format()) {
+			// The zero-anchor profile has a miner fee of 0 on purpose. Every hop
+			// has to be that same profile. A non-zero profile still requires a
+			// miner fee on every hop, and the same exit format either way.
+			let zero_profile = funding.miner_fee() == Amount::ZERO && funding.anchor() == Amount::ZERO;
+			let chain_ok = if zero_profile {
+				!items.is_empty() && items.iter().all(|item| {
+					item.exit_format == funding.format()
+						&& item.miner_fee == Amount::ZERO
+						&& item.fee_amount == Amount::ZERO
+				})
+			} else {
+				all_nonzero && items.iter().all(|item| item.exit_format == funding.format())
+			};
+			if !chain_ok {
 				return Err(ArkoorConstructionError::IncompatibleExitFunding);
 			}
 		}

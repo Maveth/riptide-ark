@@ -69,6 +69,24 @@ use crate::telemetry;
 
 use super::payment_handler::PaymentAttemptHandler;
 
+fn route_fee_sat(routes: &[cln_rpc::GetroutesRoutes]) -> Option<Amount> {
+	if routes.is_empty() {
+		return None;
+	}
+	let mut msat: u64 = 0;
+	for route in routes {
+		if route.path.is_empty() {
+			return None;
+		}
+		for hop in &route.path {
+			let inn = hop.amount_in_msat.as_ref()?.msat;
+			let out = hop.amount_out_msat.as_ref()?.msat;
+			msat = msat.checked_add(inn.checked_sub(out)?)?;
+		}
+	}
+	Some(Amount::from_sat(msat.div_ceil(1000)))
+}
+
 /// Benign outcomes of a pay-invoice attempt that reflect a race with another
 /// actor rather than an internal server fault. `pay_invoice` recognizes these
 /// via downcast so it can log at `warn!` while keeping other failures at
@@ -260,6 +278,52 @@ impl LightningManager {
 			}
 		}
 		Ok(())
+	}
+
+	/// Whole-sat cost of the cheapest public route, rounded up.
+	///
+	/// `None` means there is no public route to price. The caller uses the fee
+	/// schedule. This does not reserve liquidity or send a payment.
+	pub async fn quote_route_fee(
+		&self, invoice: &Invoice, amount: Amount, expiry: BlockHeight,
+	) -> anyhow::Result<Option<Amount>> {
+		let Invoice::Bolt11(inv) = invoice else { return Ok(None) };
+		if !inv.route_hints().is_empty() {
+			return Ok(None);
+		}
+		let Some(node) = self.active_node() else { return Ok(None) };
+		let mut rpc = node.rpc.clone();
+		let tip = rpc.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner().blockheight;
+		let Some(delay) = expiry.checked_blocks_since(BlockHeight::new(tip) + self.htlc_expiry_delta) else {
+			return Ok(None);
+		};
+		let final_cltv = match u32::try_from(inv.min_final_cltv_expiry_delta()) {
+			Ok(cltv) => cltv,
+			Err(_) => return Ok(None),
+		};
+		if u64::from(final_cltv) > u64::from(delay) {
+			return Ok(None);
+		}
+		// The cap only lets the search see a normal route. The user is charged
+		// the route that comes back, plus 1 sat, not this cap.
+		let request = cln_rpc::GetroutesRequest {
+			source: node.pubkey.serialize().to_vec(),
+			destination: inv.recover_payee_pub_key().serialize().to_vec(),
+			amount_msat: Some(amount.into()),
+			layers: vec!["auto.localchans".into(), "auto.sourcefree".into(), "xpay".into()],
+			maxfee_msat: Some(Amount::from_sat(100_000).into()),
+			final_cltv, maxdelay: Some(u32::try_from(delay).unwrap_or(u32::MAX)),
+			maxparts: None,
+		};
+		let routes = match tokio::time::timeout(Duration::from_secs(10), rpc.get_routes(request)).await {
+			Ok(Ok(routes)) => routes.into_inner().routes,
+			Ok(Err(e)) => {
+				debug!("route quote failed: {:#}", e);
+				return Ok(None);
+			},
+			Err(_) => return Ok(None),
+		};
+		Ok(route_fee_sat(&routes))
 	}
 
 	/// Pays a bolt-11 invoice

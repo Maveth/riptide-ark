@@ -621,6 +621,7 @@ impl Server {
 		utxo: OutPoint,
 		funding_tx: Option<&Transaction>,
 		user_pub_nonce: PublicNonce,
+		zero_fee_board: bool,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
 		check_max_amount("board", amount, self.config.max_board_amount)?;
 
@@ -636,9 +637,10 @@ impl Server {
 			}
 		}
 
-		// Validate board fees
+		// The service fee is paid to a server output on the saved exit. The exit
+		// itself keeps miner fee 0 and one zero-value anchor.
 		let fee = self.config.fees.board.calculate(amount)
-			.context("fee overflowed")?.max(ark::exit_policy::paperclip_funding().anchor());
+			.context("fee overflowed")?;
 		validate_and_subtract_fee(amount, fee)
 			.badarg("Board amount cannot support required fee")?;
 
@@ -715,17 +717,39 @@ impl Server {
 			}
 		}
 
-		let builder = BoardBuilder::new_for_standard_cosign(
-			user_pubkey,
-			expiry_height,
-			self.server_pubkey,
-			self.config.vtxo_exit_delta,
-			amount,
-			fee,
-			ark::exit_policy::paperclip_funding().miner_fee(),
-			utxo,
-			user_pub_nonce,
-		)?;
+		// `zero_fee_board` is set only by this wallet. An older wallet leaves it
+		// unset and gets the 1,000 sat anchor plus 1,000 sat miner-fee signature.
+		let builder = if zero_fee_board {
+			BoardBuilder::new_for_zero_fee_cosign(
+				user_pubkey,
+				expiry_height,
+				self.server_pubkey,
+				self.config.vtxo_exit_delta,
+				amount,
+				fee,
+				utxo,
+				user_pub_nonce,
+			).badarg("board amount cannot fund a zero-fee exit")?
+		} else {
+			// An older wallet builds a 1,000 sat anchor and a 1,000 sat miner fee.
+			// The anchor grows when this server's board fee is already above 1,000.
+			let anchor = fee.max(Amount::from_sat(1000));
+			let miner_fee = Amount::from_sat(1000);
+			let reserve = anchor.checked_add(miner_fee).context("board reserve overflow")?;
+			validate_and_subtract_fee(amount, reserve)
+				.badarg("Board amount cannot support required fee")?;
+			BoardBuilder::new_for_standard_cosign(
+				user_pubkey,
+				expiry_height,
+				self.server_pubkey,
+				self.config.vtxo_exit_delta,
+				amount,
+				anchor,
+				miner_fee,
+				utxo,
+				user_pub_nonce,
+			).badarg("board amount cannot fund a standard exit")?
+		};
 
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
@@ -927,11 +951,18 @@ impl Server {
 		// fully-signed version serves recovery equally well.
 		let update = VtxoTreeUpdate::new()
 			.upsert_signed_tx(signed_txs)
-			.provide_signatures(vtxos)
+			.provide_signatures(vtxos.clone())
 			.mark_vtxos_registered(registered_ids);
+		let tab_chunk = bitcoin::Amount::from_sat(ark::lightning::LIGHTNING_TAB_CHUNK_SAT);
+		let tab_ids = vtxos.iter().filter(|vtxo| {
+			vtxo.amount() == tab_chunk && vtxo.policy().arkoor_pubkey() == Some(self.server_pubkey())
+		}).map(|vtxo| vtxo.id()).collect::<Vec<_>>();
 		self.db.write(async |t| {
 			t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_sends, HtlcDirection::Incoming).await?;
+			for id in &tab_ids {
+				t.credit_lightning_tab_fund(*id).await?;
+			}
 			Ok(())
 		}).await?;
 		Ok(())

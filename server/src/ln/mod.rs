@@ -1,5 +1,6 @@
 pub mod node_manager;
 pub mod offers;
+pub(crate) mod tab;
 
 pub mod cln;
 pub mod guard;
@@ -34,6 +35,30 @@ use server_rpc::TryFromBytes;
 use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 
 use crate::arkoor::ArkoorCosignRequestValidationParams;
+
+/// Service fee for a Lightning send. A priced route replaces the schedule.
+fn lightning_user_fee(route_fee: Option<Amount>, schedule_fee: Amount) -> anyhow::Result<Amount> {
+	match route_fee {
+		Some(route) => route.checked_add(Amount::from_sat(1)).context("route fee overflow"),
+		None => Ok(schedule_fee),
+	}
+}
+
+/// What Core Lightning may spend. A priced route may spend that route, and any
+/// extra the user locked above it. The schedule path keeps the configured
+/// fraction of the schedule fee.
+fn lightning_max_routing_fee(
+	route_fee: Option<Amount>, schedule_fee: Amount, extra: Amount, ln_max_fee_ppm: u64,
+) -> anyhow::Result<Amount> {
+	match route_fee {
+		Some(route) => route.checked_add(extra).context("routing fee overflow"),
+		None => schedule_fee.to_sat()
+			.checked_mul(ln_max_fee_ppm)
+			.map(|n| Amount::from_sat(n / 1_000_000))
+			.and_then(|fee| fee.checked_add(extra))
+			.context("routing fee calculation overflowed"),
+	}
+}
 use crate::database::htlc_vtxo::{self, HtlcResolution};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::database::ln::{
@@ -151,6 +176,19 @@ fn validate_receive_claim(
 }
 
 impl Server {
+	/// Public route cost in sats, or `None` when the schedule should be used.
+	/// A probe error is treated as no priced route. Nothing is sent.
+	pub async fn lightning_route_fee(&self, invoice: &Invoice, amount: Amount) -> Option<Amount> {
+		let expiry = self.sync_manager.chain_tip().height + self.config.htlc_send_expiry_delta;
+		match self.lightning_manager.quote_route_fee(invoice, amount, expiry).await {
+			Ok(fee) => fee,
+			Err(err) => {
+				warn!("Lightning route quote unavailable: {:#}", err);
+				None
+			},
+		}
+	}
+
 	#[tracing::instrument(skip(self, request, invoice))]
 	pub async fn request_lightning_pay_htlc_cosign(
 		&self,
@@ -249,14 +287,16 @@ impl Server {
 				if !invoice.has_send_lifetime(now) {
 					return badarg!("invoice expired or expires within 30 seconds; request a fresh invoice");
 				}
-				let fee = self.config.fees.lightning_send.calculate(amount, input_vtxos.iter()
+				let schedule_fee = self.config.fees.lightning_send.calculate(amount, input_vtxos.iter()
 					.map(|v| VtxoFeeInfo::from_vtxo_and_tip(&v.vtxo, chain_tip)))
 					.context("fee overflow")?;
+				let route_fee = self.lightning_route_fee(&invoice, amount).await;
+				let fee = lightning_user_fee(route_fee, schedule_fee).context("fee overflow")?;
 				let extra = htlc_amount.checked_sub(amount.checked_add(fee).context("amount overflow")?)
 					.badarg("HTLC does not cover payment and fee")?;
-				let routing_fee = fee.to_sat().checked_mul(self.config.ln_max_fee_ppm as u64)
-					.map(|n| Amount::from_sat(n / 1_000_000)).and_then(|n| n.checked_add(extra))
-					.context("routing fee overflow")?;
+				let routing_fee = lightning_max_routing_fee(
+					route_fee, schedule_fee, extra, self.config.ln_max_fee_ppm as u64,
+				).context("routing fee overflow")?;
 				if let Some(sub) = self.db.read(async |t|
 					t.get_htlc_subscription_by_payment_hash(payment_hash).await
 				).await? {
@@ -282,6 +322,8 @@ impl Server {
 		payment_amount: Amount,
 		htlc_vtxo_ids: Vec<VtxoId>,
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
+		tab_user: Option<PublicKey>,
+		tab_signature: Option<Vec<u8>>,
 	) -> anyhow::Result<()> {
 		//TODO(stevenroose) validate vtxo generally (based on input)
 		check_max_amount("lightning send", payment_amount, self.config.max_ln_send_amount)?;
@@ -294,6 +336,22 @@ impl Server {
 		// Held for the whole call, so no other call decides on this payment
 		// while the payment is validated and handed to the lightning node.
 		let _guard = self.payment_guards.lock(payment_hash).await;
+
+		// A payment under the dust floor has no HTLC vtxo. The tab ledger must
+		// cover it. The invoice is still paid by the normal Lightning send below.
+		if htlc_vtxo_ids.is_empty() {
+			let (user, signature) = match (tab_user, tab_signature) {
+				(Some(user), Some(signature)) => (user, signature),
+				_ => return badarg!(
+					"a Lightning payment needs HTLC vtxos, or a funded tab for an invoice under {} sats",
+					ark::lightning::lightning_tab_floor(),
+				),
+			};
+			return self.pay_lightning_from_tab(invoice, payment_amount, user, &signature).await;
+		}
+		if tab_user.is_some() || tab_signature.is_some() {
+			return badarg!("a tab signature is only used when the payment has no HTLC vtxo");
+		}
 
 		let htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&htlc_vtxo_ids).await).await?;
 
@@ -373,17 +431,16 @@ impl Server {
 		let tip = self.sync_manager.chain_tip();
 		let vtxo_fee_infos = vtxos.iter()
 			.map(|v| VtxoFeeInfo::from_vtxo_and_tip(v, tip.height));
-		let user_fee = self.config.fees.lightning_send.calculate(payment_amount, vtxo_fee_infos)
+		let schedule_fee = self.config.fees.lightning_send.calculate(payment_amount, vtxo_fee_infos)
 			.context("fee overflowed")?;
+		let route_fee = self.lightning_route_fee(&invoice, payment_amount).await;
+		let user_fee = lightning_user_fee(route_fee, schedule_fee).context("fee overflowed")?;
 		let amount_with_fee = payment_amount.checked_add(user_fee).context("validation overflow")?;
 
-		// the max routing fee is the configured fraction of our own fee,
-		// plus whatever additional the user pays
+		// A priced route may spend that route. Otherwise Core Lightning may spend
+		// the configured fraction of the schedule fee, plus anything extra the user pays.
 		let max_routing_fee = if let Some(extra) = htlc_vtxo_sum.checked_sub(amount_with_fee) {
-			user_fee.to_sat()
-				.checked_mul(self.config.ln_max_fee_ppm as u64)
-				.map(|n| Amount::from_sat(n / 1_000_000))
-				.and_then(|f| f.checked_add(extra))
+			lightning_max_routing_fee(route_fee, schedule_fee, extra, self.config.ln_max_fee_ppm as u64)
 				.context("routing fee calculation overflowed")?
 		} else {
 			return badarg!(
@@ -426,8 +483,13 @@ impl Server {
 
 		Ok(match status {
 			PaymentStatus::Success(preimage) => {
+				let spent = self.db.read(async |t|
+					t.lightning_tab_spent(&payment_hash).await
+				).await?;
 				lightning_payment_status::PaymentStatus::Success(protos::PaymentSuccessStatus {
 					preimage: preimage.to_vec(),
+					amount_sat: spent.map(|(amount, _)| u64::try_from(amount).unwrap_or(0)),
+					fee_sat: spent.map(|(_, fee)| u64::try_from(fee).unwrap_or(0)),
 				})
 			},
 			PaymentStatus::Failed => {
@@ -637,6 +699,8 @@ impl Server {
 		min_cltv_delta: BlockDelta,
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
 		description: Option<String>,
+		tab_user: Option<PublicKey>,
+		tab_signature: Option<Vec<u8>>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
@@ -661,6 +725,17 @@ impl Server {
 		if amount == Amount::ZERO {
 			return badarg!("Cannot create invoice for 0 sats (this would create an explicit 0 sat invoice, not an any-amount invoice)");
 		}
+		let tab_user = if amount < ark::lightning::lightning_tab_floor() {
+			let user = tab_user.context("a receive under the dust floor must name the tab key")?;
+			let signature = tab_signature.context("a receive under the dust floor must be signed")?;
+			crate::ln::tab::verify_tab_signature(&user, &signature, "receive", payment_hash.as_ref())?;
+			if self.lightning_tab_is_opted_out(user).await? {
+				return badarg!("this key opted out of small Lightning payments");
+			}
+			Some(user)
+		} else {
+			None
+		};
 
 		// Pre-check the description so we reject invalid input before reaching cln.
 		if let Some(desc) = description.as_ref() {
@@ -675,10 +750,13 @@ impl Server {
 			);
 		}
 
-		// Calculate lightning receive fees and validate fees don't exceed the received amount
-		let fee = self.config.fees.lightning_receive.calculate(amount)
-			.context("fee overflowed")?;
-		validate_and_subtract_fee(amount, fee)?;
+		// A tab receive has no VTXO and no exit, so the receive fee does not apply.
+		// The tab is credited the full invoice amount.
+		if tab_user.is_none() {
+			let fee = self.config.fees.lightning_receive.calculate(amount)
+				.context("fee overflowed")?;
+			validate_and_subtract_fee(amount, fee)?;
+		}
 
 		if let Some(max) = self.config.max_vtxo_amount {
 			if amount > max {
@@ -696,6 +774,15 @@ impl Server {
 			}
 			match subscription.status {
 				LightningHtlcSubscriptionStatus::Created => {
+					if subscription.amount() != amount {
+						return badarg!("payment hash already has an invoice for a different amount");
+					}
+					if let Some(user) = tab_user {
+						let amount_sat = i64::try_from(amount.to_sat())?;
+						self.db.write(async |t| t.register_lightning_tab_receive(
+							payment_hash, &user, amount_sat,
+						).await).await?;
+					}
 					trace!("Found existing created subscription, returning invoice: {}",
 						subscription.invoice.to_string(),
 					);
@@ -722,6 +809,11 @@ impl Server {
 		let invoice = self.lightning_manager.generate_invoice(
 			payment_hash, amount, ln_cltv_delta, description, mailbox_id,
 		).await?;
+		if let Some(user) = tab_user {
+			self.db.write(async |t| t.register_lightning_tab_receive(
+				payment_hash, &user, i64::try_from(amount.to_sat())?,
+			).await).await?;
+		}
 		trace!("Hold invoice created. payment_hash: {}, amount: {}, {}",
 			payment_hash, amount, invoice.to_string(),
 		);
@@ -828,6 +920,9 @@ impl Server {
 
 		let mut sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?
 			.not_found([payment_hash], "no pending payment with this payment hash")?;
+		if self.db.read(async |t| t.lightning_tab_receive_exists(payment_hash).await).await? {
+			return badarg!("this receive is credited to the Lightning tab and is not a coin");
+		}
 
 		slog!(LightningReceivePrepareRequested, payment_hash, user_pubkey, htlc_recv_expiry);
 

@@ -16,6 +16,7 @@ pub mod watchman;
 pub mod intman;
 pub mod ln;
 pub mod lightning_credit;
+pub mod lightning_tab;
 pub mod nursery;
 pub mod rounds;
 pub mod tree;

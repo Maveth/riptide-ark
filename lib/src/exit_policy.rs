@@ -1,7 +1,7 @@
 //! Checks for a fully signed, funded recovery path under a specified relay policy.
 //! These checks are admission checks, not a promise of future block inclusion.
 
-use bitcoin::{Amount, FeeRate, Transaction};
+use bitcoin::{Amount, FeeRate, Transaction, TxOut};
 use bitcoin_ext::{BlockDelta, BlockHeight};
 
 use crate::{Vtxo, VtxoPolicy};
@@ -21,11 +21,45 @@ pub struct FundedExitPolicy {
 
 pub const PAPERCLIP_EXIT_PROFILE: u32 = 2;
 
-/// Fixed reserves for the private regtest profile; not a future fee guarantee.
+// Update path. The live number is still 2. `docs/bark-like-recovery.md` says
+// not to repurpose profile 2, and not to use the legacy-v3 encoding as a new
+// protocol identity. We reused 2 and carried the new shape in `zero_fee_board`.
+// Checked 2026-11-11: profile 1 is only the old private regtest note in
+// VALIDATION.md. Profile 2, on published Paperclip, is the funded StandardV2
+// exit. Decided 2026-11-11: this server does not add an old-shaped round.
+// Nobody here holds that shape. The next handshake is profile 3, and both this
+// wallet and this server must require it. A 2 on either side is a different
+// Ark and is refused. Do not ship 3 on one side alone.
+// The transaction inside profile 2 changed.
+//
+// Older wallets build StandardV2. A board is a 1,000 sat anchor plus a 1,000
+// sat miner fee (`legacy_standard_funding`). A transfer, when the server
+// advertises small anchors, is a 330 sat anchor plus a 1,000 sat miner fee
+// (`legacy_small_anchor_funding`). `BoardCosignRequest.zero_fee_board` is
+// unset, so this server signs that older board.
+//
+// This wallet builds a version-3 parent with miner fee 0 and one zero-value
+// anchor (`paperclip_funding`). It sets `zero_fee_board` and the server signs
+// that board. Rounds on this server use the same zero-fee shape. An older
+// wallet can board and pay here, and it can exit its own coin. It cannot join
+// one of these rounds, because it still requires the 1,000 plus 1,000 tree.
+//
+// Spending follows the coin, not the server. A zero-fee coin stays zero-fee.
+// A 1,000 plus 1,000 coin stays on `legacy_standard_funding`, which an older
+// server still accepts as its own profile. Our smaller transfer budget is
+// `small_anchor_transfer_funding`: a 330 sat anchor and a 100 sat miner fee.
+// Paperclip main also added `economical_transfer_funding`, 330 plus 198, as an
+// opt-in ordinary transfer. This server accepts that shape too.
+
+/// Miner fee for a recovery transaction that pays its own fee.
+/// About 1,000 vB at this node's 0.1 sat/vB relay floor.
+pub const RECOVERY_MINER_FEE: Amount = Amount::from_sat(100);
+
+/// Version-3 parent with miner fee 0 and one zero-value pay-to-anchor.
+/// The child spends the anchor. This is the shape the template whitelist keeps.
 pub fn paperclip_funding() -> crate::tree::signed::TreeExitFunding {
-	crate::tree::signed::TreeExitFunding::new(Amount::from_sat(1000), Amount::from_sat(1000))
-		.expect("constant funded profile is valid")
-		.with_format(bitcoin_ext::fee::ExitFormat::StandardV2)
+	crate::tree::signed::TreeExitFunding::new(Amount::ZERO, Amount::ZERO)
+		.expect("zero-anchor profile is valid")
 }
 
 /// Ordinary-transfer budget for servers advertising small_anchor_transfers.
@@ -33,7 +67,7 @@ pub fn paperclip_funding() -> crate::tree::signed::TreeExitFunding {
 /// P2WSH anchor to its dust threshold at the supported 3 sat/vB dust policy.
 /// Server capability negotiation is required before wallets use this budget.
 pub fn small_anchor_transfer_funding() -> crate::tree::signed::TreeExitFunding {
-	crate::tree::signed::TreeExitFunding::new(Amount::from_sat(330), Amount::from_sat(1000))
+	crate::tree::signed::TreeExitFunding::new(bitcoin_ext::P2TR_DUST, RECOVERY_MINER_FEE)
 		.expect("constant funded transfer budget is valid")
 		.with_format(bitcoin_ext::fee::ExitFormat::StandardV2)
 }
@@ -44,12 +78,30 @@ pub fn economical_transfer_funding() -> crate::tree::signed::TreeExitFunding {
 	crate::tree::signed::TreeExitFunding::economical_transfer()
 }
 
+/// The profile older wallets still build: 1,000 sat anchor and 1,000 sat miner fee.
+pub fn legacy_standard_funding() -> crate::tree::signed::TreeExitFunding {
+	crate::tree::signed::TreeExitFunding::new(Amount::from_sat(1000), Amount::from_sat(1000))
+		.expect("legacy standard profile is valid")
+		.with_format(bitcoin_ext::fee::ExitFormat::StandardV2)
+}
+
+/// Older wallets that saw small-anchor transfers use a 330 sat anchor and a 1,000 sat miner fee.
+pub fn legacy_small_anchor_funding() -> crate::tree::signed::TreeExitFunding {
+	crate::tree::signed::TreeExitFunding::new(Amount::from_sat(330), Amount::from_sat(1000))
+		.expect("legacy small-anchor profile is valid")
+		.with_format(bitcoin_ext::fee::ExitFormat::StandardV2)
+}
+
+fn zero_value_anchor(output: &TxOut) -> bool {
+	output.value == Amount::ZERO && output.script_pubkey == *bitcoin_ext::fee::P2A_SCRIPT
+}
+
 pub fn paperclip_policy() -> FundedExitPolicy {
 	FundedExitPolicy {
-		minimum_relay: FeeRate::from_sat_per_kwu(250),
+		minimum_relay: FeeRate::from_sat_per_kwu(25),
 		dust_relay: FeeRate::from_sat_per_kwu(750),
 		confirmation_margin: BlockDelta::new(12),
-		claim_fee: Amount::from_sat(1000),
+		claim_fee: RECOVERY_MINER_FEE,
 	}
 }
 
@@ -130,15 +182,23 @@ impl FundedExitPolicy {
 			.ok_or("missing funding output")?.clone();
 		for item in vtxo.transactions() {
 			let total = item.tx.output.iter().try_fold(Amount::ZERO, |sum, o| {
+				if zero_value_anchor(o) { return Some(sum); }
 				if o.value < o.script_pubkey.minimal_non_dust_custom(self.dust_relay) { return None; }
 				sum.checked_add(o.value)
 			}).ok_or("dust output or output value overflow in recovery path")?;
 			let fee = prev.value.checked_sub(total).ok_or("unfunded recovery transaction")?;
-			let required = (item.tx.vsize() as u64).checked_mul(4)
-				.and_then(|w| w.checked_mul(self.minimum_relay.to_sat_per_kwu()))
-				.and_then(|v| v.checked_add(999)).map(|v| v / 1000)
-				.ok_or("relay fee overflow")?;
-			if fee.to_sat() < required { return Err("recovery parent is below its individual relay floor".into()); }
+			// A version-3 parent with fee 0 and one zero pay-to-anchor is mined
+			// because the child pays. It is not held to the per-transaction floor.
+			let zero_anchor_parent = fee == Amount::ZERO
+				&& item.tx.version.0 == 3
+				&& item.tx.output.iter().filter(|o| zero_value_anchor(o)).count() == 1;
+			if !zero_anchor_parent {
+				let required = (item.tx.vsize() as u64).checked_mul(4)
+					.and_then(|w| w.checked_mul(self.minimum_relay.to_sat_per_kwu()))
+					.and_then(|v| v.checked_add(999)).map(|v| v / 1000)
+					.ok_or("relay fee overflow")?;
+				if fee.to_sat() < required { return Err("recovery parent is below its individual relay floor".into()); }
+			}
 			prev = item.tx.output.get(item.output_idx).ok_or("invalid recovery output index")?.clone();
 		}
 		let claim_floor = prev.script_pubkey.minimal_non_dust_custom(self.dust_relay);

@@ -224,9 +224,129 @@ impl rpc::server::ArkService for Server {
 
 		let resp = self.cosign_board(
 			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce,
+			req.zero_fee_board,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp.into()))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn quote_lightning_send(
+		&self,
+		req: tonic::Request<protos::QuoteLightningSendRequest>,
+	) -> Result<tonic::Response<protos::QuoteLightningSendResponse>, tonic::Status> {
+		let req = req.into_inner();
+		let invoice = Invoice::from_str(&req.invoice)
+			.map_err(|_| tonic::Status::invalid_argument("invalid lightning invoice"))?;
+		let user_amount = (req.amount_sat > 0).then_some(Amount::from_sat(req.amount_sat));
+		let amount = invoice.get_payment_amount(user_amount)
+			.map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+		let response = match self.lightning_route_fee(&invoice, amount).await {
+			Some(route_fee) => {
+				let user_fee = route_fee.checked_add(Amount::from_sat(1))
+					.ok_or_else(|| tonic::Status::internal("route fee overflow"))?;
+				protos::QuoteLightningSendResponse {
+					route_found: true,
+					route_fee_sat: route_fee.to_sat(),
+					user_fee_sat: user_fee.to_sat(),
+				}
+			},
+			None => protos::QuoteLightningSendResponse {
+				route_found: false,
+				route_fee_sat: 0,
+				user_fee_sat: 0,
+			},
+		};
+		Ok(tonic::Response::new(response))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn get_lightning_tabs(
+		&self,
+		req: tonic::Request<protos::LightningTabsRequest>,
+	) -> Result<tonic::Response<protos::LightningTabsResponse>, tonic::Status> {
+		let response = self.lightning_tabs(&req.into_inner().tabs).await.to_status()?;
+		Ok(tonic::Response::new(response))
+	}
+
+	async fn get_lightning_tab(
+		&self,
+		req: tonic::Request<protos::LightningTabAuth>,
+	) -> Result<tonic::Response<protos::LightningTabBalance>, tonic::Status> {
+		let (user, balance) = self.authenticated_tab(req.into_inner(), "balance", &[]).await.to_status()?;
+		let opted_out = self.lightning_tab_is_opted_out(user).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningTabBalance {
+			balance_sat: balance, forfeited_sat: 0, opted_out,
+		}))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn withdraw_lightning_tab(
+		&self,
+		req: tonic::Request<protos::WithdrawLightningTabRequest>,
+	) -> Result<tonic::Response<protos::WithdrawLightningTabResponse>, tonic::Status> {
+		let req = req.into_inner();
+		let user = bitcoin::secp256k1::PublicKey::from_slice(&req.user_pubkey)
+			.map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+		let dest = bitcoin::secp256k1::PublicKey::from_slice(&req.destination_pubkey)
+			.map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+		let (amount, vtxos) = self.withdraw_lightning_tab(user, &req.signature, dest).await.to_status()?;
+		let encoded = vtxos.iter().map(|vtxo| vtxo.serialize()).collect::<Vec<_>>();
+		Ok(tonic::Response::new(protos::WithdrawLightningTabResponse {
+			amount_sat: amount.to_sat(),
+			vtxo: encoded.first().cloned().unwrap_or_default(),
+			vtxos: encoded,
+		}))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn forfeit_lightning_tab(
+		&self,
+		req: tonic::Request<protos::LightningTabAuth>,
+	) -> Result<tonic::Response<protos::LightningTabBalance>, tonic::Status> {
+		let (user, _) = self.authenticated_tab(req.into_inner(), "forfeit", &[]).await.to_status()?;
+		let forfeited = self.forfeit_lightning_tab_sat(user).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningTabBalance {
+			balance_sat: 0, forfeited_sat: forfeited, opted_out: false,
+		}))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn set_lightning_tab_opt_out(
+		&self,
+		req: tonic::Request<protos::SetLightningTabOptOutRequest>,
+	) -> Result<tonic::Response<protos::LightningTabBalance>, tonic::Status> {
+		let req = req.into_inner();
+		let payload = [u8::from(req.opted_out)];
+		let (user, _) = self.authenticated_tab(
+			protos::LightningTabAuth { user_pubkey: req.user_pubkey, signature: req.signature },
+			"opt",
+			&payload,
+		).await.to_status()?;
+		let balance = self.set_lightning_tab_opt_out(user, req.opted_out).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningTabBalance {
+			balance_sat: balance, forfeited_sat: 0, opted_out: req.opted_out,
+		}))
+	}
+
+	#[tracing::instrument(skip(self, req))]
+	async fn settle_lightning_tab_receive(
+		&self,
+		req: tonic::Request<protos::SettleLightningTabReceiveRequest>,
+	) -> Result<tonic::Response<protos::LightningTabBalance>, tonic::Status> {
+		let req = req.into_inner();
+		let hash = PaymentHash::from_bytes(req.payment_hash)
+			.map_err(|_| tonic::Status::invalid_argument("invalid payment hash"))?;
+		let preimage = Preimage::try_from(req.payment_preimage.as_slice())
+			.map_err(|_| tonic::Status::invalid_argument("invalid preimage"))?;
+		let user = PublicKey::from_slice(&req.user_pubkey)
+			.map_err(|_| tonic::Status::invalid_argument("invalid tab user pubkey"))?;
+		let balance = self.settle_lightning_tab_receive(hash, preimage, user, &req.signature)
+			.await.to_status()?;
+		let opted_out = self.lightning_tab_is_opted_out(user).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningTabBalance {
+			balance_sat: balance, forfeited_sat: 0, opted_out,
+		}))
 	}
 
 	/// Registers a board vtxo
@@ -361,10 +481,13 @@ impl rpc::server::ArkService for Server {
 			.map(ark::mailbox::MailboxIdentifier::deserialize)
 			.transpose()
 			.map_err(|_| tonic::Status::invalid_argument("invalid mailbox_id"))?;
+		let tab_user = req.tab_user_pubkey.as_deref().map(PublicKey::from_slice).transpose()
+			.map_err(|_| tonic::Status::invalid_argument("invalid tab user pubkey"))?;
+		let tab_signature = req.tab_signature;
 
-		self.initiate_lightning_payment(invoice, payment_amount, htlc_vtxo_ids, mailbox_id)
-			.await
-			.to_status()?;
+		self.initiate_lightning_payment(
+			invoice, payment_amount, htlc_vtxo_ids, mailbox_id, tab_user, tab_signature,
+		).await.to_status()?;
 		Ok(tonic::Response::new(protos::Empty {}))
 	}
 
@@ -470,12 +593,16 @@ impl rpc::server::ArkService for Server {
 			.transpose()
 			.map_err(|_| tonic::Status::invalid_argument("invalid mailbox_id"))?;
 
+		let tab_user = req.tab_user_pubkey.as_deref().map(PublicKey::from_slice).transpose()
+			.map_err(|_| tonic::Status::invalid_argument("invalid tab user pubkey"))?;
 		let resp = self.start_lightning_receive(
 			payment_hash,
 			amount,
 			BlockDelta::try_from(req.min_cltv_delta).badarg("invalid min_cltv_delta")?,
 			mailbox_id,
 			req.description,
+			tab_user,
+			req.tab_signature,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))

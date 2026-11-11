@@ -640,6 +640,15 @@ impl<P: Policy> Vtxo<Full, P> {
 			.expect("genesis item count fits in u16")
 	}
 
+	/// True when every hop is the version-3 zero-fee anchor exit.
+	pub fn has_zero_fee_exit(&self) -> bool {
+		!self.genesis.items.is_empty() && self.genesis.items.iter().all(|item| {
+			item.exit_format == bitcoin_ext::fee::ExitFormat::LegacyV3
+				&& item.miner_fee == Amount::ZERO
+				&& item.fee_amount == Amount::ZERO
+		})
+	}
+
 	/// Iterate over all oor transitions in this VTXO
 	///
 	/// The outer `Vec` cointains one element for each transition.
