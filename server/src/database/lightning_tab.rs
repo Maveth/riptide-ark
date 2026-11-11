@@ -274,17 +274,24 @@ impl Tx<'_> {
 	pub async fn claim_lightning_address(
 		&self, name: &str, user: &PublicKey,
 	) -> anyhow::Result<Result<(), String>> {
+		let mine = self.query_opt(
+			"SELECT name FROM lightning_address WHERE user_pubkey = $1",
+			&[&user.to_string()],
+		).await?;
+		if let Some(row) = mine {
+			let current: String = row.get(0);
+			if current == name {
+				return Ok(Ok(()));
+			}
+			return Ok(Err("this wallet already has a name".into()));
+		}
 		let taken = self.query_opt(
-			"SELECT user_pubkey FROM lightning_address WHERE name = $1",
+			"SELECT 1 FROM lightning_address WHERE name = $1",
 			&[&name],
 		).await?;
-		if let Some(row) = taken {
-			let owner: String = row.get(0);
-			if owner != user.to_string() {
-				return Ok(Err("that name is already taken".into()));
-			}
+		if taken.is_some() {
+			return Ok(Err("that name is already taken".into()));
 		}
-		self.execute("DELETE FROM lightning_address WHERE user_pubkey = $1", &[&user.to_string()]).await?;
 		self.execute(
 			"INSERT INTO lightning_address (name, user_pubkey) VALUES ($1, $2)",
 			&[&name, &user.to_string()],
