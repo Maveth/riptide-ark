@@ -783,6 +783,8 @@ impl LightningManager {
 			None,
 		).await).await?;
 		let _ = self.payment_update_tx.send(payment_hash);
+		// The lightning-address callback must not hand this bolt11 out again.
+		crate::ln::address::forget_settled_coin_invoice(payment_hash);
 
 		// Only meter on the caller that actually flipped the row; retries
 		// (race, WAL replay) hit the same site with `newly_settled = false`.
@@ -825,6 +827,7 @@ impl LightningManager {
 			Some(subscription.status),
 		).await).await?;
 		self.notify_payment_update(payment_hash);
+		crate::ln::address::forget_settled_coin_invoice(payment_hash);
 
 		// Only meter cancels after HTLCs were accepted (bare invoice timeouts
 		// don't count) and only on the caller that actually flipped the row.

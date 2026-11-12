@@ -395,4 +395,62 @@ impl Tx<'_> {
 		).await?;
 		Ok(Some(balance.map(|r| r.get(0)).unwrap_or(amount)))
 	}
+
+	/// Credited tab receives and spent tab sends for these keys.
+	/// Amount is signed: a receive is positive, a send is the invoice plus the fee kept.
+	pub async fn lightning_tab_activity(
+		&self, users: &[String],
+	) -> anyhow::Result<Vec<LightningTabActivityRow>> {
+		let rows = self.query(
+			"SELECT direction, amount_sat, fee_sat, at, payment_hash FROM (
+				SELECT * FROM (
+					SELECT DISTINCT ON (r.payment_hash)
+						'received' AS direction,
+						r.amount_sat,
+						0::bigint AS fee_sat,
+						COALESCE(s.updated_at, s.accepted_at, s.created_at) AS at,
+						r.payment_hash
+					FROM lightning_tab_receive r
+					LEFT JOIN lightning_htlc_subscription s ON s.payment_hash = r.payment_hash
+					WHERE r.user_pubkey = ANY($1) AND r.credited
+					ORDER BY r.payment_hash, s.updated_at DESC NULLS LAST
+				) received
+				UNION ALL
+				SELECT * FROM (
+					SELECT DISTINCT ON (p.payment_hash)
+						'sent' AS direction,
+						-(p.amount_sat + p.fee_sat) AS amount_sat,
+						p.fee_sat,
+						COALESCE(s.updated_at, s.created_at) AS at,
+						p.payment_hash
+					FROM lightning_tab_payment p
+					LEFT JOIN lightning_htlc_subscription s ON s.payment_hash = p.payment_hash
+					WHERE p.user_pubkey = ANY($1) AND p.status = 'spent'
+					ORDER BY p.payment_hash, s.updated_at DESC NULLS LAST
+				) sent
+			) activity
+			ORDER BY at DESC NULLS LAST
+			LIMIT 200",
+			&[&users],
+		).await?;
+		let mut out = Vec::with_capacity(rows.len());
+		for row in rows {
+			out.push(LightningTabActivityRow {
+				direction: row.get(0),
+				amount_sat: row.get(1),
+				fee_sat: row.get(2),
+				at: row.get(3),
+				payment_hash: row.get(4),
+			});
+		}
+		Ok(out)
+	}
+}
+
+pub struct LightningTabActivityRow {
+	pub direction: String,
+	pub amount_sat: i64,
+	pub fee_sat: i64,
+	pub at: Option<chrono::DateTime<chrono::Local>>,
+	pub payment_hash: String,
 }

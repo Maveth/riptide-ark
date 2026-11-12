@@ -45,6 +45,8 @@ service ArkService {
 	rpc GetLightningTab(LightningTabAuth) returns (LightningTabBalance) {}
 	// Every key in one call. Each entry includes its opt-out flag.
 	rpc GetLightningTabs(LightningTabsRequest) returns (LightningTabsResponse) {}
+	// Credited receives and spent sends, so the wallet can show when and how much.
+	rpc ListLightningTabActivity(LightningTabsRequest) returns (LightningTabActivity) {}
 	rpc ForfeitLightningTab(LightningTabAuth) returns (LightningTabBalance) {}
 	// Pay tab balance back into a coin while the server is up.
 	rpc WithdrawLightningTab(WithdrawLightningTabRequest) returns (WithdrawLightningTabResponse) {}
@@ -377,6 +379,21 @@ message LightningTabsResponse {
 	repeated LightningTabEntry tabs = 1;
 	uint64 balance_sat = 2;
 	bool opted_out = 3;
+}
+
+message LightningTabActivityEntry {
+	// "received" or "sent".
+	string direction = 1;
+	// Positive when the tab gained sats. Negative when it spent them, fee included.
+	int64 amount_sat = 2;
+	uint64 fee_sat = 3;
+	// When the payment settled, RFC3339. Empty when the server has no time.
+	string at = 4;
+	string payment_hash = 5;
+}
+
+message LightningTabActivity {
+	repeated LightningTabActivityEntry entries = 1;
 }
 
 message LightningTabBalance {

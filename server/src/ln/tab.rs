@@ -69,6 +69,31 @@ impl Server {
 		Ok(server_rpc::protos::LightningTabsResponse { tabs, balance_sat, opted_out })
 	}
 
+	/// Credited receives and spent sends. Same signature as a balance read,
+	/// one signature per key. The reply has no invoice and no preimage.
+	pub(crate) async fn lightning_tab_activity(
+		&self, auths: &[server_rpc::protos::LightningTabAuth],
+	) -> anyhow::Result<server_rpc::protos::LightningTabActivity> {
+		if auths.len() > 1024 {
+			anyhow::bail!("too many tab keys");
+		}
+		let mut users = Vec::with_capacity(auths.len());
+		for auth in auths {
+			let user = PublicKey::from_slice(&auth.user_pubkey).context("invalid tab user pubkey")?;
+			verify_tab_signature(&user, &auth.signature, "activity", &[])?;
+			users.push(user.to_string());
+		}
+		let rows = self.db.read(async |t| t.lightning_tab_activity(&users).await).await?;
+		let entries = rows.into_iter().map(|row| server_rpc::protos::LightningTabActivityEntry {
+			direction: row.direction,
+			amount_sat: row.amount_sat,
+			fee_sat: u64::try_from(row.fee_sat).unwrap_or(0),
+			at: row.at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+			payment_hash: row.payment_hash,
+		}).collect();
+		Ok(server_rpc::protos::LightningTabActivity { entries })
+	}
+
 	pub(crate) async fn forfeit_lightning_tab_sat(&self, user: PublicKey) -> anyhow::Result<u64> {
 		let forfeited = self.db.write(async |t| t.forfeit_lightning_tab(&user).await).await?;
 		u64::try_from(forfeited).context("forfeited tab")

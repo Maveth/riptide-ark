@@ -1,10 +1,11 @@
 //! Lightning addresses (`name@ark-riptide.maveth.ca`).
 //!
 //! A payer's wallet fetches `/.well-known/lnurlp/{name}` and then asks the
-//! callback for a fresh invoice. Under 1,000 sats the server creates that
-//! invoice and credits the tab when it is paid. At 1,000 sats or more the
-//! open wallet creates the coin invoice. There is no maximum other than the
-//! amount this node can receive.
+//! callback for an invoice. Under 1,000 sats the server creates that invoice
+//! and credits the tab when it is paid. At 1,000 sats or more the open wallet
+//! creates one coin invoice. A later request for that same unpaid amount gets
+//! the bolt11 already made. There is no maximum other than the amount this
+//! node can receive.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -30,9 +31,27 @@ const HTTP_ADDR: &str = "0.0.0.0:3537";
 /// Stay under the current receivable side of the bridge.
 const MAX_SENDABLE_SAT: u64 = 150_000_000;
 
+struct Inflight {
+	/// Bumped when the wallet is asked again, so an older timer cannot
+	/// cancel the build that replaced it.
+	id: u64,
+	amount_sat: u64,
+	waiters: Vec<oneshot::Sender<Result<String, String>>>,
+}
+
+struct ReadyCoin {
+	amount_sat: u64,
+	bolt11: String,
+	expires_at: std::time::SystemTime,
+	payment_hash: Option<PaymentHash>,
+}
+
 struct CoinWait {
 	wallet: Mutex<HashMap<String, oneshot::Sender<u64>>>,
-	invoice: Mutex<HashMap<String, oneshot::Sender<String>>>,
+	/// One build per name. A retry waits on that build instead of starting another.
+	inflight: Mutex<HashMap<String, Inflight>>,
+	/// The last unpaid invoice. A later request for the same amount gets this bolt11.
+	ready: Mutex<HashMap<String, ReadyCoin>>,
 }
 
 fn hub() -> &'static CoinWait {
@@ -40,8 +59,59 @@ fn hub() -> &'static CoinWait {
 	static HUB: OnceLock<CoinWait> = OnceLock::new();
 	HUB.get_or_init(|| CoinWait {
 		wallet: Mutex::new(HashMap::new()),
-		invoice: Mutex::new(HashMap::new()),
+		inflight: Mutex::new(HashMap::new()),
+		ready: Mutex::new(HashMap::new()),
 	})
+}
+
+fn ready_invoice(name: &str, amount_sat: u64) -> Option<String> {
+	let mut ready = hub().ready.lock();
+	let coin = ready.get(name)?;
+	let fresh = coin.amount_sat == amount_sat
+		&& coin.expires_at > std::time::SystemTime::now();
+	if fresh {
+		return Some(coin.bolt11.clone());
+	}
+	ready.remove(name);
+	None
+}
+
+fn next_inflight_id() -> u64 {
+	use std::sync::atomic::{AtomicU64, Ordering};
+	static NEXT: AtomicU64 = AtomicU64::new(1);
+	NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn take_inflight(name: &str, pred: impl Fn(&Inflight) -> bool) -> Option<Inflight> {
+	let mut map = hub().inflight.lock();
+	match map.get(name) {
+		Some(job) if pred(job) => map.remove(name),
+		_ => None,
+	}
+}
+
+fn deliver(job: Inflight, result: Result<String, String>) {
+	for waiter in job.waiters {
+		let _ = waiter.send(result.clone());
+	}
+}
+
+/// How long one wallet build may hold the name before a new request may start.
+const INFLIGHT_LIMIT: Duration = Duration::from_secs(180);
+
+fn fail_inflight_later(name: String, id: u64) {
+	tokio::spawn(async move {
+		tokio::time::sleep(INFLIGHT_LIMIT).await;
+		if let Some(job) = take_inflight(&name, |job| job.id == id) {
+			deliver(job, Err("the Riptide wallet did not answer in time".into()));
+		}
+	});
+}
+
+/// Drop a handed-out coin invoice once it has been settled, so the next
+/// payment of the same amount gets a new one.
+pub(crate) fn forget_settled_coin_invoice(hash: PaymentHash) {
+	hub().ready.lock().retain(|_, coin| coin.payment_hash != Some(hash));
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -82,7 +152,21 @@ impl Server {
 		let name = self.db.read(async |t| t.lightning_address_for_user(&user).await).await?
 			.context("this key has no lightning address")?;
 		let (tx, rx) = oneshot::channel();
-		hub().wallet.lock().insert(name, tx);
+		// This runs only while the wallet is idle. If a build was asked for
+		// and never came back, hand that same amount over again.
+		let resumed = {
+			let mut inflight = hub().inflight.lock();
+			inflight.get_mut(&name).map(|job| {
+				job.id = next_inflight_id();
+				(job.amount_sat, job.id)
+			})
+		};
+		if let Some((amount, id)) = resumed {
+			let _ = tx.send(amount);
+			fail_inflight_later(name, id);
+		} else {
+			hub().wallet.lock().insert(name, tx);
+		}
 		match tokio::time::timeout(Duration::from_secs(55), rx).await {
 			Ok(Ok(amount)) => Ok(amount),
 			_ => Ok(0),
@@ -95,8 +179,28 @@ impl Server {
 		crate::ln::tab::verify_tab_signature(&user, signature, "name-invoice", bolt11.as_bytes())?;
 		let name = self.db.read(async |t| t.lightning_address_for_user(&user).await).await?
 			.context("this key has no lightning address")?;
-		if let Some(tx) = hub().invoice.lock().remove(&name) {
-			let _ = tx.send(bolt11.to_string());
+		let parsed = bolt11.parse::<lightning_invoice::Bolt11Invoice>().ok();
+		let amount_sat = parsed.as_ref()
+			.and_then(|invoice| invoice.amount_milli_satoshis())
+			.map(|msat| msat / 1000)
+			.or_else(|| hub().inflight.lock().get(&name).map(|job| job.amount_sat))
+			.unwrap_or(0);
+		let expires_at = parsed.as_ref().and_then(|invoice| {
+			invoice.expires_at().map(|until| std::time::SystemTime::UNIX_EPOCH + until)
+		}).unwrap_or_else(|| std::time::SystemTime::now() + Duration::from_secs(3600));
+		let payment_hash = parsed.as_ref().map(|invoice| {
+			PaymentHash::from(*invoice.payment_hash())
+		});
+		if amount_sat > 0 {
+			hub().ready.lock().insert(name.clone(), ReadyCoin {
+				amount_sat,
+				bolt11: bolt11.to_string(),
+				expires_at,
+				payment_hash,
+			});
+		}
+		if let Some(job) = take_inflight(&name, |job| job.amount_sat == amount_sat) {
+			deliver(job, Ok(bolt11.to_string()));
 		}
 		Ok(())
 	}
@@ -226,16 +330,42 @@ async fn create_tab_invoice(
 }
 
 async fn ask_wallet(name: &str, amount_sat: u64) -> Result<String, String> {
-	let Some(waiter) = hub().wallet.lock().remove(name) else {
-		return Err("open the Riptide wallet to receive 1000 sats or more".into());
-	};
-	if waiter.send(amount_sat).is_err() {
-		return Err("open the Riptide wallet to receive 1000 sats or more".into());
+	if let Some(bolt11) = ready_invoice(name, amount_sat) {
+		return Ok(bolt11);
 	}
 	let (tx, rx) = oneshot::channel();
-	hub().invoice.lock().insert(name.to_string(), tx);
-	match tokio::time::timeout(Duration::from_secs(12), rx).await {
-		Ok(Ok(bolt11)) => Ok(bolt11),
+	let started = {
+		let mut inflight = hub().inflight.lock();
+		if let Some(job) = inflight.get_mut(name) {
+			if job.amount_sat != amount_sat {
+				return Err("a different amount is already being prepared".into());
+			}
+			job.waiters.push(tx);
+			None
+		} else {
+			let id = next_inflight_id();
+			inflight.insert(name.to_string(), Inflight {
+				id,
+				amount_sat,
+				waiters: vec![tx],
+			});
+			Some(id)
+		}
+	};
+	if let Some(id) = started {
+		let sent = hub().wallet.lock().remove(name)
+			.map(|waiter| waiter.send(amount_sat).is_ok())
+			.unwrap_or(false);
+		if sent {
+			fail_inflight_later(name.to_string(), id);
+		} else if let Some(job) = take_inflight(name, |job| job.id == id) {
+			deliver(job, Err(
+				"open the Riptide wallet to receive 1000 sats or more".into(),
+			));
+		}
+	}
+	match tokio::time::timeout(Duration::from_secs(60), rx).await {
+		Ok(Ok(result)) => result,
 		_ => Err("the Riptide wallet did not answer in time".into()),
 	}
 }

@@ -312,6 +312,14 @@ impl rpc::server::ArkService for Server {
 		Ok(tonic::Response::new(response))
 	}
 
+	async fn list_lightning_tab_activity(
+		&self,
+		req: tonic::Request<protos::LightningTabsRequest>,
+	) -> Result<tonic::Response<protos::LightningTabActivity>, tonic::Status> {
+		let response = self.lightning_tab_activity(&req.into_inner().tabs).await.to_status()?;
+		Ok(tonic::Response::new(response))
+	}
+
 	async fn get_lightning_tab(
 		&self,
 		req: tonic::Request<protos::LightningTabAuth>,
