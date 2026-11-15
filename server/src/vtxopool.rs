@@ -647,11 +647,22 @@ impl Process {
 		let reserve = Amount::from_sat(self.config.onchain_reserve_sat);
 		let (mut wallet, funding_psbt) = self.srv.rounds_wallet.build_blocking(
 			move |wallet| {
+				// Do not spend unconfirmed change. The rounds wallet still
+				// holds change from the 0.11 sat/vB chain, and spending it
+				// would start another transaction behind that chain. Once
+				// that change confirms, it is an ordinary coin again.
+				let unconfirmed: Vec<OutPoint> = wallet.list_unspent()
+					.filter(|utxo| !utxo.chain_position.is_confirmed())
+					.map(|utxo| utxo.outpoint)
+					.collect();
 				let selection = WithGuaranteedChange(SingleRandomDraw);
 				let psbt = wallet.build_tx_at_chunk_feerate(selection, fee_rate, |b| {
+					for outpoint in &unconfirmed {
+						b.add_unspendable(*outpoint);
+					}
 					b.add_recipient(txout.script_pubkey.clone(), txout.value);
 					Ok(())
-				}).context("failed to build signed tree funding tx")?;
+				}).context("pool issuance skipped until a confirmed coin can fund it")?;
 				let cost = txout.value.checked_add(psbt.fee().context("pool funding fee")?)
 					.context("pool funding cost overflow")?;
 				if wallet.available_balance().checked_sub(cost).is_none_or(|remaining| remaining < reserve) {

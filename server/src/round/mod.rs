@@ -898,6 +898,7 @@ impl CollectingPayments {
 				script_pubkey: vtxos_spec.funding_tx_script_pubkey(),
 				value: vtxos_spec.total_required_value(),
 			},
+			// The server asks the node. This is the 1-block estimate, capped by max_fee_rate.
 			fee_rate: srv.fee_estimator.fast(),
 			pinned_input: self.common_round_tx_input.take(),
 		}.build(&srv.rounds_wallet).await.map_err(RoundError::Recoverable)?;

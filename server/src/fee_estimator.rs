@@ -75,11 +75,12 @@ pub struct Config {
 	/// Fallback fee rate for slow transactions when estimation fails.
 	#[serde(with = "crate::utils::serde::fee_rate")]
 	pub fallback_fee_rate_slow: FeeRate,
-	/// Optional ceiling applied to every fetched fee rate.
+	/// Ceiling on the fee rate the server asks the node for.
 	///
-	/// If the backend returns a rate above this value (e.g. due to a bad
-	/// mempool spike), it is clamped down to this maximum instead of being
-	/// used verbatim.  Leave unset to impose no ceiling.
+	/// The server asks the node with `estimatesmartfee` and uses that
+	/// answer. A round uses the fast target. This value is only the
+	/// highest rate that answer is allowed to reach. It is not the fee
+	/// that gets paid. Leave unset to impose no ceiling.
 	#[serde(default, with = "crate::utils::serde::fee_rate::opt")]
 	pub max_fee_rate: Option<FeeRate>,
 }
@@ -114,6 +115,13 @@ impl FeeEstimator {
 			fee_rates: parking_lot::RwLock::new([(initial, Instant::now())].into()),
 			history_duration, max_fee_rate,
 		}
+	}
+
+	/// Highest rate a package bump may pay. This is the configured ceiling
+	/// when one is set, otherwise the fast estimate the server just asked
+	/// the node for.
+	pub fn package_bump_target(&self) -> FeeRate {
+		self.max_fee_rate.unwrap_or_else(|| self.fast())
 	}
 
 	/// Returns the fast fee rate (1-block confirmation target).

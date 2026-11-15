@@ -1,7 +1,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Local};
 use tokio::sync::broadcast;
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 
 use ark::lightning::{PaymentHash, Preimage};
 
@@ -116,8 +116,14 @@ impl<'a> PaymentAttemptHandler<'a> {
 				if let Some(user_fee) = attempt.user_fee {
 					let routing = attempt.routing_fee_sat_from(final_amount_msat);
 					let kept = routing.saturating_add(1).min(user_fee.to_sat());
-					let kept = i64::try_from(kept).context("settled tab fee overflow")?;
-					t.settle_lightning_tab_fee(&attempt.payment_hash, kept).await?;
+					let kept_i64 = i64::try_from(kept).context("settled tab fee overflow")?;
+					t.settle_lightning_tab_fee(&attempt.payment_hash, kept_i64).await?;
+					let refund = i64::try_from(user_fee.to_sat().saturating_sub(kept))
+						.context("fee change overflow")?;
+					let credited = t.credit_coin_fee_change(&attempt.payment_hash, refund).await?;
+					if credited {
+						tracing::info!(refund, "Lightning fee change credited to the tab");
+					}
 				}
 			}
 			if updated && preimage.is_some() {

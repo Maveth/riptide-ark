@@ -356,25 +356,72 @@ impl LightningManager {
 		destination: &bitcoin::secp256k1::PublicKey, amount: Amount, final_cltv: u32, delay: u32,
 	) -> anyhow::Result<Option<u64>> {
 		// The cap only lets the search see a normal route. The user is charged
-		// the route that comes back, plus 1 sat, not this cap.
+		// the dearer of the cheapest route and one alternate, plus 1 sat.
+		// The payment may spend up to that. A route that works for less
+		// does not keep the difference.
+		let routes = match self.routes(rpc, source, destination, amount, final_cltv, delay, None).await {
+			Some(routes) => routes,
+			None => return Ok(None),
+		};
+		let Some(cheapest) = route_fee_sat(&routes) else { return Ok(None); };
+		let avoid = routes.first().and_then(|route| route.path.first()).and_then(|hop| hop.node_id_out.clone());
+		let alternate = if let Some(node) = avoid {
+			self.routes(rpc, source, destination, amount, final_cltv, delay, Some(&node)).await
+				.and_then(|routes| route_fee_sat(&routes))
+				.filter(|fee| *fee > cheapest)
+		} else {
+			None
+		};
+		let ceiling = alternate.unwrap_or(cheapest);
+		Ok(Some(ceiling.to_sat().saturating_mul(1000)))
+	}
+
+	async fn routes(
+		&self, rpc: &mut cln_rpc::ClnGrpcClient, source: &bitcoin::secp256k1::PublicKey,
+		destination: &bitcoin::secp256k1::PublicKey, amount: Amount, final_cltv: u32, delay: u32,
+		avoid: Option<&[u8]>,
+	) -> Option<Vec<cln_rpc::GetroutesRoutes>> {
+		let mut layers = vec!["auto.localchans".into(), "auto.sourcefree".into(), "xpay".into()];
+		let layer = avoid.map(|_| format!(
+			"riptide-quote-{}",
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+		));
+		if let (Some(node), Some(layer)) = (avoid, layer.as_ref()) {
+			if rpc.ask_rene_create_layer(cln_rpc::AskrenecreatelayerRequest {
+				layer: layer.clone(), persistent: Some(false),
+			}).await.is_err() {
+				return None;
+			}
+			let disabled = rpc.ask_rene_disable_node(cln_rpc::AskrenedisablenodeRequest {
+				layer: layer.clone(), node: node.to_vec(),
+			}).await.is_ok();
+			if !disabled {
+				let _ = rpc.ask_rene_remove_layer(cln_rpc::AskreneremovelayerRequest { layer: layer.clone() }).await;
+				return None;
+			}
+			layers.push(layer.clone());
+		}
 		let request = cln_rpc::GetroutesRequest {
 			source: source.serialize().to_vec(),
 			destination: destination.serialize().to_vec(),
 			amount_msat: Some(amount.into()),
-			layers: vec!["auto.localchans".into(), "auto.sourcefree".into(), "xpay".into()],
+			layers,
 			maxfee_msat: Some(Amount::from_sat(100_000).into()),
 			final_cltv, maxdelay: Some(delay),
 			maxparts: None,
 		};
 		let routes = match tokio::time::timeout(Duration::from_secs(10), rpc.get_routes(request)).await {
-			Ok(Ok(routes)) => routes.into_inner().routes,
+			Ok(Ok(routes)) => Some(routes.into_inner().routes),
 			Ok(Err(e)) => {
 				debug!("route quote failed: {:#}", e);
-				return Ok(None);
+				None
 			},
-			Err(_) => return Ok(None),
+			Err(_) => None,
 		};
-		Ok(route_fee_sat(&routes).map(|fee| fee.to_sat().saturating_mul(1000)))
+		if let Some(layer) = layer {
+			let _ = rpc.ask_rene_remove_layer(cln_rpc::AskreneremovelayerRequest { layer }).await;
+		}
+		routes
 	}
 
 	/// Pays a bolt-11 invoice

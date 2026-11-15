@@ -130,6 +130,36 @@ impl Tx<'_> {
 		Ok(row.map(|row| (row.get(0), row.get(1))))
 	}
 
+	/// Credit the part of a coin Lightning fee the route did not use.
+	///
+	/// A tab spend already returned its leftover through [`Self::settle_lightning_tab_fee`].
+	/// Opt-out only stops the key from sending or receiving through the tab.
+	/// A fee return is still credited, and a missing tab row is created.
+	pub async fn credit_coin_fee_change(
+		&self, hash: &PaymentHash, refund_sat: i64,
+	) -> anyhow::Result<bool> {
+		if refund_sat <= 0 {
+			return Ok(false);
+		}
+		let tab_spend = self.query_opt(
+			"SELECT 1 FROM lightning_tab_payment WHERE payment_hash = $1",
+			&[&hash.to_string()],
+		).await?;
+		if tab_spend.is_some() {
+			return Ok(false);
+		}
+		let sender = self.get_lightning_sender_mailbox_id(*hash).await?;
+		let Some(sender) = sender else { return Ok(false) };
+		let user = sender.as_pubkey().to_string();
+		self.execute(
+			"INSERT INTO lightning_tab (user_pubkey, balance_sat) VALUES ($1, $2)
+			 ON CONFLICT (user_pubkey) DO UPDATE
+			 SET balance_sat = lightning_tab.balance_sat + EXCLUDED.balance_sat",
+			&[&user, &refund_sat],
+		).await?;
+		Ok(true)
+	}
+
 	/// Lower a spent tab fee to what the route actually cost, plus 1 sat.
 	///
 	/// An unpriced invoice, including one with a route hint, is debited at the

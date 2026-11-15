@@ -223,7 +223,10 @@ impl VtxoTreeSpec {
 
 	/// Select the funded profile before the funding transaction or signatures exist.
 	pub fn with_exit_funding(mut self, funding: TreeExitFunding) -> Result<Self, &'static str> {
-		if funding.miner_fee() < Amount::from_sat(1000) {
+		// Zero anchor and zero miner fee is the round and pool tree. A smaller
+		// non-zero miner fee is an ordinary transfer budget, not a tree.
+		let zero_fee_tree = funding.anchor() == Amount::ZERO && funding.miner_fee() == Amount::ZERO;
+		if !zero_fee_tree && funding.miner_fee() < Amount::from_sat(1000) {
 			return Err("economical transfer funding is not a tree budget");
 		}
 		if self.vtxos.len() < 2 { return Err("funded tree requires at least two leaves; use a board for one balance"); }
@@ -2028,6 +2031,15 @@ mod test {
 		assert!(TreeExitFunding::new(Amount::ZERO, Amount::from_sat(1000)).is_ok());
 		assert!(TreeExitFunding::new(Amount::from_sat(1), Amount::ZERO).is_err());
 		assert!(TreeExitFunding::new(Amount::MAX_MONEY, Amount::MAX_MONEY).is_err());
+		let two = || VtxoTreeSpec::new((0..2).map(|_| VtxoLeafSpec {
+			vtxo: VtxoRequest { amount: Amount::from_sat(100_000),
+				policy: VtxoPolicy::new_pubkey(user.public_key()) },
+			cosign_pubkey: None,
+			unlock_hash: sha256::Hash::hash(&[7; 32]),
+		}).collect(), server.public_key(), BlockHeight::new(1000), BlockDelta::new(6),
+			vec![server.public_key()]);
+		assert!(two().with_exit_funding(TreeExitFunding::economical_transfer()).is_err());
+		assert!(two().with_exit_funding(crate::exit_policy::paperclip_funding()).is_ok());
 	}
 	#[test]
 	fn standard_v2_tree_reserves_and_reconstruction() {

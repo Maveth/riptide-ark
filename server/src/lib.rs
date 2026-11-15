@@ -26,6 +26,7 @@ pub mod bitcoind;
 mod intman;
 pub mod ln;
 pub mod nursery;
+mod package_bump;
 mod offboards;
 mod round;
 pub mod telemetry;
@@ -500,6 +501,7 @@ impl Server {
 		srv.lightning_manager.spawn_hold_settler(srv.clone(), settlement_stream);
 
 		srv.clone().start_offboard_retry_task().await;
+		package_bump::start(srv.clone());
 
 		let srv2 = srv.clone();
 		tokio::spawn(async move {

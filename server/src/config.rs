@@ -304,6 +304,13 @@ pub struct Config {
 	/// they intervene.
 	pub nursery_confirm_target_blocks: BlockDelta,
 
+	/// After a round funding tx has been unconfirmed this many blocks,
+	/// the server spends its own change to raise the whole ancestor
+	/// package toward [fee_estimator.max_fee_rate](crate::fee_estimator::Config::max_fee_rate).
+	/// The vtxo tree output is never spent. Zero disables the bump.
+	#[serde(default = "default_round_package_bump_blocks")]
+	pub round_package_bump_blocks: u32,
+
 	pub rpc: Rpc,
 	pub postgres: Postgres,
 
@@ -457,6 +464,10 @@ pub struct Config {
 	/// Only intended for testing.
 	#[serde(default)]
 	pub round_legacy_hashlock_clauses: bool,
+}
+
+fn default_round_package_bump_blocks() -> u32 {
+	12
 }
 
 impl Config {
