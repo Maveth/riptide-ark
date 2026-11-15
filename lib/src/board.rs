@@ -593,8 +593,10 @@ impl BoardBuilder<state::ServerCanBuildVtxos> {
 
 		// The exit txid doesn't commit to the funding script, so check it
 		// is the user+server musig output and not one the user owns alone.
+		// `amount` includes the service-fee sibling. The on-chain funding
+		// output pays that whole sum; the sibling is spent inside the exit.
 		let expected_funding_txout = TxOut {
-			value: vtxo.amount() + fee + miner_fee,
+			value: amount,
 			script_pubkey: exit_data.funding_taproot.script_pubkey(),
 		};
 		let funding_txout = funding_tx.output.get(vtxo.chain_anchor().vout as usize);
@@ -1133,7 +1135,7 @@ mod test {
 
 			let exit = compute_exit_data(
 				user_key.public_key(), server_key.public_key(), honest.expiry_height,
-				honest.exit_delta, amount, fee, miner_fee, exit_format, utxo,
+				honest.exit_delta, amount, fee, miner_fee, exit_format, utxo, &[],
 			);
 			let sighash = SighashCache::new(&exit.tx).unified_taproot_key_spend_signature_hash(
 				0, &sighash::Prevouts::All(&[funding_txout]), sighash::TapSighashType::Default,
