@@ -326,19 +326,20 @@ impl ClnHoldProcess {
 			},
 		};
 
-		let invoice = match Invoice::from_str(&accepted_invoice.invoice) {
-			Ok(invoice) => {
-				if htlc_subscription.invoice != invoice {
-					warn!("Hold invoice does not match subscription {}", htlc_subscription.id);
-					return Ok(false);
-				}
-				invoice
-			},
+		// The hold plugin stores a BOLT11 with the same payment hash. The
+		// subscription stores the BOLT12 invoice the payer actually paid.
+		let hold_invoice = match Invoice::from_str(&accepted_invoice.invoice) {
+			Ok(invoice) => invoice,
 			Err(e) => {
-				warn!("Failed to parse invoice from cln: '{}', {}", accepted_invoice.invoice, e);
+				warn!("Failed to parse invoice from cln: {}", e);
 				return Ok(false);
 			},
 		};
+		if hold_invoice.payment_hash() != htlc_subscription.invoice.payment_hash() {
+			warn!("Hold invoice does not match subscription {}", htlc_subscription.id);
+			return Ok(false);
+		}
+		let invoice = htlc_subscription.invoice.clone();
 
 		// Get current tip for expiry validation
 		let tip = self.sync_manager.chain_tip().height;

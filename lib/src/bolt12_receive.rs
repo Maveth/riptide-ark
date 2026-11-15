@@ -4,6 +4,7 @@
 use std::io::Cursor;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
 use lightning::sign::KeysManager;
+use lightning::offers::invoice_error::InvoiceError;
 use lightning::onion_message::offers::OffersMessage;
 use lightning::onion_message::messenger::{create_onion_message, Destination, OnionMessagePath};
 use lightning::blinded_path::EmptyNodeIdLookUp;
@@ -13,17 +14,12 @@ use bitcoin::constants::ChainHash;
 use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use bitcoin::secp256k1::{ecdh::SharedSecret, Keypair, PublicKey, Scalar, SecretKey};
 use lightning::blinded_path::{BlindedHop, message::BlindedMessagePath};
-use lightning::blinded_path::payment::{
-	BlindedPaymentPath, Bolt12OfferContext, PaymentConstraints, PaymentContext,
-	UnauthenticatedReceiveTlvs,
-};
-use lightning::ln::inbound_payment::ExpandedKey;
+use lightning::blinded_path::payment::{BlindedPayInfo, BlindedPaymentPath};
+use lightning::types::features::BlindedHopFeatures;
 use lightning::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
-use lightning::offers::invoice_request::{InvoiceRequest, InvoiceRequestFields};
-use lightning::offers::nonce::Nonce;
+use lightning::offers::invoice_request::InvoiceRequest;
 use lightning::offers::offer::{Amount as OfferAmount, Offer, OfferBuilder};
 use lightning::sign::EntropySource;
-use lightning::types::payment::PaymentSecret;
 use lightning::util::ser::{BigSize, Readable, Writeable};
 
 use crate::lightning::Preimage;
@@ -130,15 +126,75 @@ fn relay_message_path(relay: PublicKey) -> Result<BlindedMessagePath, ReceiveErr
 		vec![BlindedHop { blinded_node_id, encrypted_payload }]))
 }
 
-/// Extract the exact offer fields from a signed invoice request.
-pub fn request_offer(bytes: &[u8]) -> Result<Offer, ReceiveError> {
+/// Token the hold plugin compares with the arriving HTLC. Derived from the
+/// payment hash so the server can rebuild it without the wallet's key.
+pub fn hold_path_id(payment_hash: &[u8]) -> [u8; 32] {
+	let mut engine = HmacEngine::<sha256::Hash>::new(b"Paperclip XBT BOLT12 hold path id v1");
+	engine.input(payment_hash);
+	Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+}
+
+/// One-hop payment path Core Lightning can pay. The encrypted hop carries the
+/// standard payment constraints plus a 32-byte path id. CLN copies that id
+/// into the HTLC payment secret, which is what the existing hold plugin checks.
+fn relay_payment_path(
+	relay: PublicKey, cltv_delta: u16, maximum_height: u32, payment_hash: &[u8],
+) -> Result<BlindedPaymentPath, ReceiveError> {
+	let mut constraints = Vec::with_capacity(8);
+	constraints.extend_from_slice(&maximum_height.to_be_bytes());
+	BigSize(1).write(&mut constraints).expect("Vec write");
+	let mut plain = Vec::new();
+	append_record(&mut plain, 6, &hold_path_id(payment_hash));
+	append_record(&mut plain, 12, &constraints);
+
+	let secret = SecretKey::from_slice(&Entropy.get_secure_random_bytes()).map_err(ldk_error)?;
+	let path_key = PublicKey::from_secret_key(&SECP, &secret);
+	let shared = SharedSecret::new(&relay, &secret);
+	let subkey = |label: &[u8]| {
+		let mut engine = HmacEngine::<sha256::Hash>::new(label);
+		engine.input(shared.as_ref());
+		Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
+	};
+	let tweak = Scalar::from_be_bytes(subkey(b"blinded_node_id")).map_err(ldk_error)?;
+	let blinded_node_id = relay.mul_tweak(&SECP, &tweak).map_err(ldk_error)?;
+	let cipher = ChaCha20Poly1305::new(&subkey(b"rho").into());
+	let encrypted_payload = cipher.encrypt(&[0u8; 12].into(), plain.as_ref()).map_err(ldk_error)?;
+	Ok(BlindedPaymentPath::from_blinded_path_and_payinfo(
+		relay, path_key, vec![BlindedHop { blinded_node_id, encrypted_payload }],
+		BlindedPayInfo {
+			fee_base_msat: 0,
+			fee_proportional_millionths: 0,
+			cltv_expiry_delta: cltv_delta,
+			htlc_minimum_msat: 1,
+			htlc_maximum_msat: u64::MAX,
+			features: BlindedHopFeatures::empty(),
+		},
+	))
+}
+
+fn offer_record(kind: u64) -> bool {
+	(1..80).contains(&kind) || (1_000_000_000..2_000_000_000).contains(&kind)
+}
+
+/// The offer fields inside an offer or an invoice request, without the
+/// signature. Both sides hash these bytes so a payer's encoding still matches
+/// the offer the wallet registered.
+pub fn offer_fields(bytes: &[u8]) -> Result<Vec<u8>, ReceiveError> {
 	let mut encoded = Vec::new();
 	for (kind, value) in records(bytes)? {
-		if (1..80).contains(&kind) || (1_000_000_000..2_000_000_000).contains(&kind) {
-			append_record(&mut encoded, kind, value);
-		}
+		if offer_record(kind) { append_record(&mut encoded, kind, value); }
 	}
-	Offer::try_from(encoded).map_err(ldk_error)
+	if encoded.is_empty() { return Err(invalid("no offer fields")); }
+	Ok(encoded)
+}
+
+pub fn offer_fields_id(bytes: &[u8]) -> Result<[u8; 32], ReceiveError> {
+	Ok(sha256::Hash::hash(&offer_fields(bytes)?).to_byte_array())
+}
+
+/// Extract the exact offer fields from a signed invoice request.
+pub fn request_offer(bytes: &[u8]) -> Result<Offer, ReceiveError> {
+	Offer::try_from(offer_fields(bytes)?).map_err(ldk_error)
 }
 
 pub fn parse_request(
@@ -177,20 +233,7 @@ pub fn create_invoice(
 ) -> Result<Bolt12Invoice, ReceiveError> {
 	if offer.issuer_signing_pubkey() != Some(key.public_key()) { return Err(invalid("wrong signing key")); }
 	if cltv_delta == 0 { return Err(invalid("zero CLTV delta")); }
-	let entropy = Entropy;
-	let tlvs = UnauthenticatedReceiveTlvs {
-		payment_secret: PaymentSecret(rand::random()),
-		payment_constraints: PaymentConstraints { max_cltv_expiry: maximum_height, htlc_minimum_msat: 1 },
-		payment_context: PaymentContext::Bolt12Offer(Bolt12OfferContext {
-			offer_id: offer.id(), invoice_request: InvoiceRequestFields {
-				payer_signing_pubkey: request.payer_signing_pubkey(),
-				quantity: request.quantity(),
-				payer_note_truncated: None,
-				human_readable_name: request.offer_from_hrn().clone(),
-			},
-		}),
-	}.authenticate(Nonce::from_entropy_source(&entropy), &ExpandedKey::new(rand::random()));
-	let path = BlindedPaymentPath::one_hop(relay, tlvs, cltv_delta, &entropy, &SECP).map_err(ldk_error)?;
+	let path = relay_payment_path(relay, cltv_delta, maximum_height, preimage.compute_payment_hash().as_ref())?;
 	let unsigned = request.respond_with(vec![path], lightning::types::payment::PaymentHash(
 		preimage.compute_payment_hash().to_byte_array(),
 	)).map_err(ldk_error)?.relative_expiry(900).build().map_err(ldk_error)?;
@@ -201,10 +244,29 @@ pub fn create_invoice(
 	}).map_err(ldk_error)
 }
 
-/// Construct a reply packet to inject at the relay CLN node. The temporary
+/// Construct a reply packet whose first hop is the relay, so Core Lightning
+/// can peel it with injectonionmessage and forward the rest. The temporary
 /// signer is only used for onion construction, never for the invoice itself.
+/// A reply path that starts at the relay must be peeled before this runs;
+/// otherwise the invoice is delivered back to the relay.
 pub fn invoice_reply(
 	relay: PublicKey, reply_path: BlindedMessagePath, invoice: Bolt12Invoice,
+) -> Result<(PublicKey, Vec<u8>), ReceiveError> {
+	onion_reply(relay, reply_path, OffersMessage::Invoice(invoice))
+}
+
+/// A refusal the payer can read. Used when the wallet does not return an
+/// invoice, so Core Lightning does not answer "Unknown offer" for us.
+pub fn invoice_error_reply(
+	relay: PublicKey, reply_path: BlindedMessagePath, message: String,
+) -> Result<(PublicKey, Vec<u8>), ReceiveError> {
+	let message: String = message.chars().filter(|c| c.is_ascii() && !c.is_control()).take(160).collect();
+	let message = if message.is_empty() { "offer unavailable".to_string() } else { message };
+	onion_reply(relay, reply_path, OffersMessage::InvoiceError(InvoiceError::from_string(message)))
+}
+
+fn onion_reply(
+	relay: PublicKey, reply_path: BlindedMessagePath, message: OffersMessage,
 ) -> Result<(PublicKey, Vec<u8>), ReceiveError> {
 	let keys = KeysManager::new(&rand::random(), 0, 0, true);
 	let lookup = EmptyNodeIdLookUp {};
@@ -214,22 +276,24 @@ pub fn invoice_reply(
 		first_node_addresses: Vec::new(),
 	};
 	let (first, message, _) = create_onion_message(
-		&&keys, &&keys, &&lookup, &SECP, path, OffersMessage::Invoice(invoice), None,
+		&&keys, &&keys, &&lookup, &SECP, path, message, None,
 	).map_err(ldk_error)?;
 	if first != relay { return Err(invalid("reply does not start at relay")); }
 	Ok((message.blinding_point, message.onion_routing_packet.encode()))
 }
 
-/// Verify that an invoice echoes the exact request fields, not another
-/// request for the same offer. The invoice's signature is checked by LDK.
+/// The invoice answers this request when the offer, payer, chain, and amount
+/// agree. Payers do not encode those fields in the same bytes we do, so a raw
+/// TLV compare refuses a real invoice. The invoice signature is checked by LDK
+/// when the invoice is parsed.
 pub fn matches_request(invoice: &Bolt12Invoice, request: &[u8]) -> Result<bool, ReceiveError> {
-	fn request_field(kind: u64) -> bool {
-		kind < 160 || (1_000_000_000..3_000_000_000).contains(&kind)
-	}
-	let encoded = invoice.encode();
-	let invoice_fields: Vec<_> = records(&encoded)?.into_iter().filter(|(k, _)| request_field(*k)).collect();
-	let request_fields: Vec<_> = records(request)?.into_iter().filter(|(k, _)| request_field(*k)).collect();
-	Ok(invoice_fields == request_fields)
+	if request.len() > MAX_MESSAGE_BYTES { return Err(invalid("message too large")); }
+	let parsed = InvoiceRequest::try_from(request.to_vec()).map_err(ldk_error)?;
+	if parsed.chain() != invoice.chain() { return Ok(false); }
+	if parsed.payer_signing_pubkey() != invoice.payer_signing_pubkey() { return Ok(false); }
+	let Some(amount_msat) = parsed.amount_msats() else { return Ok(false); };
+	if amount_msat != invoice.amount_msats() { return Ok(false); }
+	Ok(invoice.offer_id() == Some(request_offer(request)?.id()))
 }
 
 /// Domain-separated proof that a relay session owns an offer's signing key.
@@ -247,6 +311,8 @@ mod tests {
 	use super::*;
 	use bitcoin::secp256k1::SecretKey;
 	use lightning::ln::channelmanager::PaymentId;
+	use lightning::ln::inbound_payment::ExpandedKey;
+	use lightning::offers::nonce::Nonce;
 	use crate::lightning::{Bolt12InvoiceExt, Invoice};
 
 	fn key(byte: u8) -> Keypair {
@@ -281,6 +347,8 @@ mod tests {
 		assert!(offer.offer_features().requires_blake2b_identity());
 		let first = request(&offer, 20_000_000, 1);
 		let second = request(&offer, 30_000_000, 2);
+		assert_eq!(offer_fields_id(&offer.encode()).unwrap(), offer_fields_id(&first).unwrap());
+		assert_eq!(request_offer(&first).unwrap().id(), offer.id());
 		let first_secret = request_preimage(&key, &first).unwrap();
 		assert_eq!(first_secret, request_preimage(&key, &first).unwrap());
 		assert_ne!(first_secret, request_preimage(&key, &second).unwrap());
@@ -291,6 +359,7 @@ mod tests {
 			let invoice = create_invoice(&req, &offer, &key, relay, secret, 200, 1_000_000).unwrap();
 			invoice.validate_issuance(&offer, bitcoin::Amount::from_sat(amount)).unwrap();
 			assert!(matches_request(&invoice, &encoded).unwrap());
+			assert!(!matches_request(&invoice, &request(&offer, amount * 1000 + 1000, 9)).unwrap());
 			let invoice = Invoice::Bolt12(invoice);
 			invoice.require_xbt().unwrap();
 			invoice.check_signature().unwrap();
