@@ -289,8 +289,8 @@ impl rpc::server::ArkService for Server {
 		let auth = req.into_inner();
 		let user = bitcoin::secp256k1::PublicKey::from_slice(&auth.user_pubkey)
 			.map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-		let amount_sat = self.wait_lightning_address_coin(user, &auth.signature).await.to_status()?;
-		Ok(tonic::Response::new(protos::LightningAddressCoin { amount_sat }))
+		let (amount_sat, metadata) = self.wait_lightning_address_coin(user, &auth.signature).await.to_status()?;
+		Ok(tonic::Response::new(protos::LightningAddressCoin { amount_sat, metadata }))
 	}
 
 	async fn submit_lightning_address_invoice(
@@ -652,6 +652,7 @@ impl rpc::server::ArkService for Server {
 			BlockDelta::try_from(req.min_cltv_delta).badarg("invalid min_cltv_delta")?,
 			mailbox_id,
 			req.description,
+			req.description_hash,
 			tab_user,
 			req.tab_signature,
 		).await.to_status()?;

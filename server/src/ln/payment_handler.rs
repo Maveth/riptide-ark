@@ -120,7 +120,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 					t.settle_lightning_tab_fee(&attempt.payment_hash, kept_i64).await?;
 					let refund = i64::try_from(user_fee.to_sat().saturating_sub(kept))
 						.context("fee change overflow")?;
-					let credited = t.credit_coin_fee_change(&attempt.payment_hash, refund).await?;
+					let credited = t.credit_coin_fee_change(&attempt.payment_hash, refund, kept_i64).await?;
 					if credited {
 						tracing::info!(refund, "Lightning fee change credited to the tab");
 					}

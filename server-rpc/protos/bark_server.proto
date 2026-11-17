@@ -358,6 +358,8 @@ message LightningAddress {
 
 message LightningAddressCoin {
 	uint64 amount_sat = 1;
+	// LNURL metadata string. The invoice description hash is sha256 of these bytes.
+	string metadata = 2;
 }
 
 message SubmitLightningAddressInvoiceRequest {
@@ -481,6 +483,8 @@ message StartLightningReceiveRequest {
 	// the payment hash. The receive credits this key's tab.
 	optional bytes tab_user_pubkey = 6;
 	optional bytes tab_signature = 7;
+	// When set, the invoice uses this 32-byte description hash instead of description.
+	optional bytes description_hash = 8;
 }
 
 message StartLightningReceiveResponse {

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::PublicKey;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,6 +28,15 @@ use crate::error::ContextExt;
 use crate::Server;
 
 pub const ADDRESS_HOST: &str = "ark-riptide.maveth.ca";
+
+/// The LNURL metadata string. The invoice description hash is sha256 of these exact bytes.
+pub(crate) fn pay_metadata(name: &str) -> String {
+	format!(r#"[["text/plain","Pay {name} at Riptide Ark"]]"#)
+}
+
+pub(crate) fn metadata_digest(metadata: &str) -> Vec<u8> {
+	sha256::Hash::hash(metadata.as_bytes()).to_byte_array().to_vec()
+}
 const HTTP_ADDR: &str = "0.0.0.0:3537";
 /// Stay under the current receivable side of the bridge.
 const MAX_SENDABLE_SAT: u64 = 150_000_000;
@@ -147,7 +157,7 @@ impl Server {
 
 	pub(crate) async fn wait_lightning_address_coin(
 		&self, user: PublicKey, signature: &[u8],
-	) -> anyhow::Result<u64> {
+	) -> anyhow::Result<(u64, String)> {
 		crate::ln::tab::verify_tab_signature(&user, signature, "balance", &[])?;
 		let name = self.db.read(async |t| t.lightning_address_for_user(&user).await).await?
 			.context("this key has no lightning address")?;
@@ -167,10 +177,12 @@ impl Server {
 		} else {
 			hub().wallet.lock().insert(name, tx);
 		}
-		match tokio::time::timeout(Duration::from_secs(55), rx).await {
-			Ok(Ok(amount)) => Ok(amount),
-			_ => Ok(0),
-		}
+		let amount = match tokio::time::timeout(Duration::from_secs(55), rx).await {
+			Ok(Ok(amount)) => amount,
+			_ => 0,
+		};
+		let metadata = if amount == 0 { String::new() } else { pay_metadata(&name) };
+		Ok((amount, metadata))
 	}
 
 	pub(crate) async fn submit_lightning_address_invoice(
@@ -263,11 +275,14 @@ async fn route(srv: &Server, path: &str, query: &str) -> String {
 
 async fn metadata(srv: &Server, name: &str) -> String {
 	match srv.db.read(async |t| t.lightning_address_owner(name).await).await {
-		Ok(Some(_)) => format!(
-			r#"{{"tag":"payRequest","callback":"https://{host}/lnurlp/{name}/invoice","minSendable":1000,"maxSendable":{max},"metadata":"[[\"text/plain\",\"Pay {name} at Riptide Ark\"]]"}}"#,
-			host = ADDRESS_HOST,
-			max = MAX_SENDABLE_SAT * 1000,
-		),
+		Ok(Some(_)) => {
+			let metadata = pay_metadata(name).replace('\\', "\\\\").replace('"', "\\\"");
+			format!(
+				r#"{{"tag":"payRequest","callback":"https://{host}/lnurlp/{name}/invoice","minSendable":1000,"maxSendable":{max},"metadata":"{metadata}"}}"#,
+				host = ADDRESS_HOST,
+				max = MAX_SENDABLE_SAT * 1000,
+			)
+		},
 		_ => r#"{"status":"ERROR","reason":"unknown lightning address"}"#.to_string(),
 	}
 }
@@ -317,8 +332,9 @@ async fn create_tab_invoice(
 ) -> anyhow::Result<String> {
 	let preimage = Preimage::random();
 	let hash = preimage.compute_payment_hash();
+	let metadata = pay_metadata(name);
 	let invoice = srv.lightning_manager.generate_invoice(
-		hash, amount, srv.config.htlc_expiry_delta, Some(format!("Riptide {name}")), None,
+		hash, amount, srv.config.htlc_expiry_delta, None, Some(metadata_digest(&metadata)), None,
 	).await?;
 	let bytes = preimage.to_vec();
 	srv.db.write(async |t| {

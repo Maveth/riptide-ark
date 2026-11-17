@@ -135,12 +135,14 @@ impl Tx<'_> {
 	/// A tab spend already returned its leftover through [`Self::settle_lightning_tab_fee`].
 	/// Opt-out only stops the key from sending or receiving through the tab.
 	/// A fee return is still credited, and a missing tab row is created.
+	/// A second call for the same payment changes nothing.
 	pub async fn credit_coin_fee_change(
-		&self, hash: &PaymentHash, refund_sat: i64,
+		&self, hash: &PaymentHash, refund_sat: i64, kept_sat: i64,
 	) -> anyhow::Result<bool> {
 		if refund_sat <= 0 {
 			return Ok(false);
 		}
+		ensure!(kept_sat >= 0, "kept fee cannot be negative");
 		let tab_spend = self.query_opt(
 			"SELECT 1 FROM lightning_tab_payment WHERE payment_hash = $1",
 			&[&hash.to_string()],
@@ -151,6 +153,17 @@ impl Tx<'_> {
 		let sender = self.get_lightning_sender_mailbox_id(*hash).await?;
 		let Some(sender) = sender else { return Ok(false) };
 		let user = sender.as_pubkey().to_string();
+		let inserted = self.query_opt(
+			"INSERT INTO lightning_tab_fee_credit
+			 (payment_hash, user_pubkey, refund_sat, kept_sat)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (payment_hash) DO NOTHING
+			 RETURNING payment_hash",
+			&[&hash.to_string(), &user, &refund_sat, &kept_sat],
+		).await?;
+		if inserted.is_none() {
+			return Ok(false);
+		}
 		self.execute(
 			"INSERT INTO lightning_tab (user_pubkey, balance_sat) VALUES ($1, $2)
 			 ON CONFLICT (user_pubkey) DO UPDATE
@@ -158,6 +171,31 @@ impl Tx<'_> {
 			&[&user, &refund_sat],
 		).await?;
 		Ok(true)
+	}
+
+	/// Route cost plus 1 sat kept from a coin Lightning payment, when known.
+	pub async fn kept_coin_lightning_fee(
+		&self, hash: &PaymentHash,
+	) -> anyhow::Result<Option<u64>> {
+		let row = self.query_opt(
+			"SELECT user_fee_sat, amount_msat, final_amount_msat
+			 FROM lightning_payment_attempt
+			 WHERE payment_hash = $1 AND status = 'succeeded'
+			 ORDER BY created_at DESC
+			 LIMIT 1",
+			&[&hash.to_string()],
+		).await?;
+		let Some(row) = row else { return Ok(None) };
+		let user_fee: Option<i64> = row.get(0);
+		let amount_msat: i64 = row.get(1);
+		let final_amount_msat: Option<i64> = row.get(2);
+		let Some(user_fee) = user_fee.filter(|fee| *fee >= 0) else { return Ok(None) };
+		let routing = final_amount_msat.map(|sent| {
+			let extra = u64::try_from(sent).unwrap_or(0)
+				.saturating_sub(u64::try_from(amount_msat).unwrap_or(0));
+			extra.saturating_add(999) / 1000
+		}).unwrap_or(0);
+		Ok(Some(routing.saturating_add(1).min(u64::try_from(user_fee).unwrap_or(0))))
 	}
 
 	/// Lower a spent tab fee to what the route actually cost, plus 1 sat.
@@ -458,6 +496,14 @@ impl Tx<'_> {
 					WHERE p.user_pubkey = ANY($1) AND p.status = 'spent'
 					ORDER BY p.payment_hash, s.updated_at DESC NULLS LAST
 				) sent
+				UNION ALL
+				SELECT 'fee-return' AS direction,
+					c.refund_sat AS amount_sat,
+					c.kept_sat AS fee_sat,
+					c.created_at AS at,
+					c.payment_hash
+				FROM lightning_tab_fee_credit c
+				WHERE c.user_pubkey = ANY($1)
 			) activity
 			ORDER BY at DESC NULLS LAST
 			LIMIT 200",

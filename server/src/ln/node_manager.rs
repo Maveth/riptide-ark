@@ -733,6 +733,7 @@ impl LightningManager {
 		amount: Amount,
 		cltv_delta: BlockDelta,
 		description: Option<String>,
+		description_hash: Option<Vec<u8>>,
 		receiver_mailbox_id: Option<MailboxIdentifier>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
@@ -744,7 +745,10 @@ impl LightningManager {
 			min_final_cltv_expiry: Some(cltv_delta.into()),
 			expiry: Some(self.invoice_expiry.as_secs()),
 			routing_hints: vec![],
-			description: description.map(hold_plugin::invoice_request::Description::Memo),
+			description: match description_hash {
+				Some(hash) => Some(hold_plugin::invoice_request::Description::Hash(hash)),
+				None => description.map(hold_plugin::invoice_request::Description::Memo),
+			},
 		}).await?.into_inner();
 
 		let invoice = Bolt11Invoice::from_str(&res.bolt11)?;

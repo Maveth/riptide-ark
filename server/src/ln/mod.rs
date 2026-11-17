@@ -484,13 +484,21 @@ impl Server {
 
 		Ok(match status {
 			PaymentStatus::Success(preimage) => {
-				let spent = self.db.read(async |t|
-					t.lightning_tab_spent(&payment_hash).await
-				).await?;
+				let (spent, kept) = self.db.read(async |t| {
+					let spent = t.lightning_tab_spent(&payment_hash).await?;
+					let kept = if spent.is_some() {
+						None
+					} else {
+						t.kept_coin_lightning_fee(&payment_hash).await?
+					};
+					Ok::<_, anyhow::Error>((spent, kept))
+				}).await?;
 				lightning_payment_status::PaymentStatus::Success(protos::PaymentSuccessStatus {
 					preimage: preimage.to_vec(),
 					amount_sat: spent.map(|(amount, _)| u64::try_from(amount).unwrap_or(0)),
-					fee_sat: spent.map(|(_, fee)| u64::try_from(fee).unwrap_or(0)),
+					fee_sat: spent
+						.map(|(_, fee)| u64::try_from(fee).unwrap_or(0))
+						.or(kept),
 				})
 			},
 			PaymentStatus::Failed => {
@@ -700,6 +708,7 @@ impl Server {
 		min_cltv_delta: BlockDelta,
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
 		description: Option<String>,
+		description_hash: Option<Vec<u8>>,
 		tab_user: Option<PublicKey>,
 		tab_signature: Option<Vec<u8>>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
@@ -738,6 +747,11 @@ impl Server {
 			None
 		};
 
+		if let Some(hash) = description_hash.as_ref() {
+			if hash.len() != 32 {
+				return badarg!("description hash must be 32 bytes");
+			}
+		}
 		// Pre-check the description so we reject invalid input before reaching cln.
 		if let Some(desc) = description.as_ref() {
 			if let Err(e) = lightning_invoice::Description::new(desc.clone()) {
@@ -808,7 +822,7 @@ impl Server {
 		let ln_cltv_delta = min_cltv_delta + self.config.htlc_expiry_delta;
 
 		let invoice = self.lightning_manager.generate_invoice(
-			payment_hash, amount, ln_cltv_delta, description, mailbox_id,
+			payment_hash, amount, ln_cltv_delta, description, description_hash, mailbox_id,
 		).await?;
 		if let Some(user) = tab_user {
 			self.db.write(async |t| t.register_lightning_tab_receive(
