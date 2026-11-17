@@ -173,9 +173,9 @@ impl Server {
 		};
 		if let Some((amount, id)) = resumed {
 			let _ = tx.send(amount);
-			fail_inflight_later(name, id);
+			fail_inflight_later(name.clone(), id);
 		} else {
-			hub().wallet.lock().insert(name, tx);
+			hub().wallet.lock().insert(name.clone(), tx);
 		}
 		let amount = match tokio::time::timeout(Duration::from_secs(55), rx).await {
 			Ok(Ok(amount)) => amount,
